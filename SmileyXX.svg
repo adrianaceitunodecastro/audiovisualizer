@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 540" width="512" height="540">
+  <!-- Crazy "X-eyes + tongue" smiley. Black hollow line-art, transparent interior.
+       Built with a mask: white = ink, black = knocked-out (transparent). -->
+  <mask id="ink" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="540">
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <!-- FACE outline (solid line) + sketchy double arc near the top -->
+      <circle cx="256" cy="250" r="205" stroke="#fff" stroke-width="13"/>
+      <path d="M90,154 A192,192 0 0 1 445,217" stroke="#fff" stroke-width="6"/>
+
+      <!-- EYES: hollow X's = thick white then thinner black knockout -->
+      <g stroke="#fff" stroke-width="40">
+        <path d="M141,173 L225,257 M225,173 L141,257"/>
+        <path d="M287,173 L371,257 M371,173 L287,257"/>
+      </g>
+      <g stroke="#000" stroke-width="22">
+        <path d="M141,173 L225,257 M225,173 L141,257"/>
+        <path d="M287,173 L371,257 M371,173 L287,257"/>
+      </g>
+
+      <!-- MOUTH: hollow smile (wide grin) -->
+      <path d="M132,350 Q256,492 380,350" stroke="#fff" stroke-width="30"/>
+      <path d="M132,350 Q256,492 380,350" stroke="#000" stroke-width="16"/>
+
+      <!-- TONGUE: elongated outlined lobe drooping from the right of the grin.
+           white body -> black knockout -> white centre crease. -->
+      <g transform="rotate(36 392 452)">
+        <ellipse cx="392" cy="452" rx="40" ry="68" fill="#fff"/>
+        <ellipse cx="392" cy="452" rx="26" ry="54" fill="#000"/>
+        <path d="M392,392 L392,512" fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round"/>
+      </g>
+    </g>
+  </mask>
+
+  <rect x="0" y="0" width="512" height="540" fill="#000" mask="url(#ink)"/>
+</svg>

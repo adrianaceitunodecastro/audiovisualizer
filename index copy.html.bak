@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>SONAR · Audio Visualizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Montserrat:wght@400;700;900&family=Orbitron:wght@500;700;900&family=Oswald:wght@300;400;600;700&family=Pacifico&family=Playfair+Display:ital,wght@0,400;0,700;0,900;1,400;1,700&family=Space+Grotesk:wght@300;400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="stage"></canvas>
+
+  <!-- Drop / load overlay -->
+  <div id="intro" class="intro">
+    <div class="intro-card" id="dropzone">
+      <div class="logo">SONAR</div>
+      <p class="tagline">Audio&nbsp;Visualizer</p>
+      <div class="drop-hint">
+        <svg viewBox="0 0 24 24" width="46" height="46" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 16V4M12 4l-4 4M12 4l4 4" />
+          <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+        </svg>
+        <span>Drop a WAV / MP3 — or click to browse</span>
+      </div>
+      <div class="intro-actions">
+        <button id="micBtn" class="ghost-btn" type="button" title="Visualize live microphone input">Use Microphone</button>
+      </div>
+      <input id="fileInput" type="file" accept=".wav,.wave,.mp3,.ogg,.oga,.opus,.flac,.m4a,.aac,audio/*" hidden />
+    </div>
+    <p class="hint-keys">scenes&nbsp;<b>1</b>–<b>8</b> · <b>space</b> play/pause · <b>F</b> fullscreen · <b>H</b> hide UI</p>
+  </div>
+
+  <!-- Now-playing + mode badge -->
+  <div id="topbar" class="topbar hidden">
+    <div class="track" id="trackName">—</div>
+    <div class="mode-badge" id="modeBadge">AURORA</div>
+  </div>
+
+  <!-- Transport -->
+  <div id="controls" class="controls hidden">
+    <button id="playBtn" class="icon-btn" type="button" aria-label="Play/Pause">
+      <svg class="i-play" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      <svg class="i-pause" viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="display:none"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+    </button>
+
+    <div class="seek">
+      <span id="curTime" class="time">0:00</span>
+      <div class="seek-wrap">
+        <input id="seek" class="seek-bar" type="range" min="0" max="1000" value="0" step="1" />
+        <div id="kfMarks" class="kf-marks"></div>
+      </div>
+      <span id="durTime" class="time">0:00</span>
+    </div>
+
+    <div class="vol">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+      <input id="vol" class="vol-bar" type="range" min="0" max="100" value="90" />
+    </div>
+
+    <div class="mode-switch" id="modeSwitch">
+      <button data-mode="0" class="m active" type="button">Aurora</button>
+      <button data-mode="1" class="m" type="button">Spectrum</button>
+      <button data-mode="2" class="m" type="button">Tunnel</button>
+      <button data-mode="3" class="m" type="button">Galaxy</button>
+      <button data-mode="4" class="m" type="button">Synthwave</button>
+      <button data-mode="5" class="m" type="button">Kaleido</button>
+      <button data-mode="6" class="m" type="button">Liquid</button>
+      <button data-mode="7" class="m" type="button">Scope</button>
+    </div>
+
+    <button id="autoBtn" class="icon-btn" type="button" aria-label="Automation" title="Automation timeline">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-7 4 18 2-9 2 3h4"/></svg>
+    </button>
+    <button id="brandBtn" class="icon-btn" type="button" aria-label="Logo & text" title="Logo & text overlay">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 15l5-5 4 4 3-3 6 6"/><circle cx="8.5" cy="8.5" r="1.5"/></svg>
+    </button>
+    <button id="loadBtn" class="icon-btn" type="button" aria-label="Load file" title="Load another track">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7-7 7 7"/></svg>
+    </button>
+    <button id="recBtn" class="icon-btn" type="button" aria-label="Export video" title="Export video — records the full song in real time">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg>
+    </button>
+    <button id="fsBtn" class="icon-btn" type="button" aria-label="Fullscreen" title="Fullscreen">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </button>
+  </div>
+
+  <!-- Recording indicator (DOM only — never captured into the video) -->
+  <div id="recBadge" class="rec-badge hidden">
+    <span class="dot"></span><span>REC</span><span id="recTime">0:00</span>
+    <span class="rec-hint">click ⬤ to stop</span>
+  </div>
+
+  <!-- Automation timeline -->
+  <div id="autoPanel" class="panel left hidden">
+    <div class="panel-head">
+      <span>Automation</span>
+      <button id="autoClose" class="x" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="panel-body">
+      <p class="panel-note">Keyframe any property over the song. Numbers &amp; colors ramp; scenes, fonts &amp; toggles snap.</p>
+
+      <div class="sec-label">New keyframe</div>
+      <label class="field">
+        <span>Property</span>
+        <select id="autoProp"></select>
+      </label>
+      <div class="field">
+        <span id="autoValLabel">Value</span>
+        <div id="autoValWrap" class="val-wrap"></div>
+      </div>
+      <label class="field">
+        <span>Ramp into it</span>
+        <select id="autoEase">
+          <option value="linear">Linear ramp</option>
+          <option value="in">Ease in</option>
+          <option value="out">Ease out</option>
+          <option value="inout">Ease in-out</option>
+          <option value="step">Step (snap)</option>
+        </select>
+      </label>
+      <div class="row">
+        <button id="autoGrab" class="mini-btn ghost" type="button">Grab current</button>
+        <button id="autoAdd" class="mini-btn" type="button">+ Add @ <span id="autoTime">0:00</span></button>
+      </div>
+
+      <div class="sec-label">Keyframes <b id="kfCount">0</b></div>
+      <div id="autoList" class="kf-list"></div>
+
+      <div class="sec-label">Save / load</div>
+      <div class="row">
+        <button id="autoExport" class="mini-btn" type="button">Export</button>
+        <button id="autoImportBtn" class="mini-btn" type="button">Import</button>
+        <button id="autoClear" class="mini-btn ghost" type="button">Clear</button>
+      </div>
+      <input id="autoImport" type="file" accept="application/json,.json" hidden />
+    </div>
+  </div>
+
+  <!-- Logo & text overlay editor -->
+  <div id="brandPanel" class="panel hidden">
+    <div class="panel-head">
+      <span>Logo &amp; Text</span>
+      <button id="brandClose" class="x" type="button" aria-label="Close">✕</button>
+    </div>
+
+    <div class="panel-body">
+      <!-- CONTENT -->
+      <div class="sec-label">Content</div>
+      <label class="field">
+        <span>Logo / image</span>
+        <div class="row">
+          <button id="logoBtn" class="mini-btn" type="button">Choose image…</button>
+          <button id="logoClear" class="mini-btn ghost" type="button">Clear</button>
+        </div>
+        <input id="logoInput" type="file" accept="image/*" hidden />
+      </label>
+      <label class="field">
+        <span>Logo size <b id="sizeVal">28%</b></span>
+        <input id="sizeRange" type="range" min="6" max="70" value="28" />
+      </label>
+      <label class="field">
+        <span>Title</span>
+        <input id="titleInput" type="text" placeholder="Song title" maxlength="80" />
+      </label>
+      <label class="field">
+        <span>Subtitle</span>
+        <input id="subInput" type="text" placeholder="Artist · album · etc." maxlength="80" />
+      </label>
+
+      <!-- TYPOGRAPHY -->
+      <div class="sec-label">Typography</div>
+      <label class="field">
+        <span>Font</span>
+        <select id="fontSel">
+          <option value='"Space Grotesk", sans-serif'>Space Grotesk</option>
+          <option value='"Bebas Neue", sans-serif'>Bebas Neue</option>
+          <option value='"Anton", sans-serif'>Anton</option>
+          <option value='"Oswald", sans-serif'>Oswald</option>
+          <option value='"Montserrat", sans-serif'>Montserrat</option>
+          <option value='"Orbitron", sans-serif'>Orbitron</option>
+          <option value='"Playfair Display", serif'>Playfair Display</option>
+          <option value='"Pacifico", cursive'>Pacifico</option>
+          <option value='Georgia, "Times New Roman", serif'>Serif</option>
+          <option value='"Courier New", monospace'>Monospace</option>
+        </select>
+      </label>
+      <div class="seg" id="styleSeg">
+        <button data-style="bold" class="active" type="button"><b>B</b></button>
+        <button data-style="italic" type="button"><i>I</i></button>
+        <button data-style="upper" type="button">AA</button>
+      </div>
+      <label class="field">
+        <span>Title size <b id="titleSizeVal">5.2%</b></span>
+        <input id="titleSize" type="range" min="2" max="16" step="0.2" value="5.2" />
+      </label>
+      <label class="field">
+        <span>Subtitle size <b id="subSizeVal">2.6%</b></span>
+        <input id="subSize" type="range" min="1" max="10" step="0.2" value="2.6" />
+      </label>
+      <label class="field">
+        <span>Letter spacing <b id="letterVal">4%</b></span>
+        <input id="letterRange" type="range" min="-5" max="40" value="4" />
+      </label>
+      <div class="field row">
+        <label class="col"><span>Title color</span><input id="titleColor" type="color" value="#ffffff" /></label>
+        <label class="col"><span>Subtitle color</span><input id="subColor" type="color" value="#bfe6ff" /></label>
+      </div>
+
+      <!-- GLOW & OUTLINE -->
+      <div class="sec-label">Glow &amp; Outline</div>
+      <div class="field row">
+        <label class="col"><span>Glow color</span><input id="glowColor" type="color" value="#6cf0ff" /></label>
+        <label class="col"><span>Outline color</span><input id="outlineColor" type="color" value="#000000" /></label>
+      </div>
+      <label class="field">
+        <span>Glow strength <b id="glowVal">100%</b></span>
+        <input id="glowRange" type="range" min="0" max="250" value="100" />
+      </label>
+      <label class="field">
+        <span>Outline width <b id="outlineVal">off</b></span>
+        <input id="outlineRange" type="range" min="0" max="14" step="0.5" value="0" />
+      </label>
+
+      <!-- LAYOUT -->
+      <div class="sec-label">Layout</div>
+      <div class="field">
+        <span>Anchor</span>
+        <div class="seg" id="posSeg">
+          <button data-pos="top" type="button">Top</button>
+          <button data-pos="center" class="active" type="button">Center</button>
+          <button data-pos="lower" type="button">Lower</button>
+        </div>
+      </div>
+      <label class="field">
+        <span>Offset X <b id="offXVal">0</b></span>
+        <input id="offXRange" type="range" min="-50" max="50" value="0" />
+      </label>
+      <label class="field">
+        <span>Offset Y <b id="offYVal">0</b></span>
+        <input id="offYRange" type="range" min="-50" max="50" value="0" />
+      </label>
+      <label class="field">
+        <span>Opacity <b id="alphaVal">100%</b></span>
+        <input id="alphaRange" type="range" min="0" max="100" value="100" />
+      </label>
+
+      <!-- REACTIVITY -->
+      <div class="sec-label">Reactivity</div>
+      <label class="field">
+        <span>Driven by</span>
+        <select id="reactSrc">
+          <option value="bass">Bass</option>
+          <option value="mid">Mids</option>
+          <option value="treble">Treble</option>
+          <option value="level">Overall level</option>
+          <option value="beat">Beat hits</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Amount <b id="amtVal">100%</b></span>
+        <input id="amtRange" type="range" min="0" max="300" value="100" />
+      </label>
+      <div class="field">
+        <span>Effects</span>
+        <div class="chips" id="fxChips">
+          <button data-fx="pulse" class="active" type="button">Pulse</button>
+          <button data-fx="bounce" type="button">Bounce</button>
+          <button data-fx="shake" type="button">Shake</button>
+          <button data-fx="wobble" type="button">Wobble</button>
+          <button data-fx="glow" class="active" type="button">Glow</button>
+          <button data-fx="hue" type="button">Hue cycle</button>
+          <button data-fx="flicker" type="button">Flicker</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

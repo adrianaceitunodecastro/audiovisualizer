@@ -1,0 +1,17 @@
+# VJ-loop masters live in vjloops/ root (DXV .mov + 4K .mp4 originals): large
+# binaries, redundant with the web-optimized clips the app actually serves.
+# Track ONLY vjloops/web/.
+vjloops/*
+!vjloops/web/
+
+# (also ignore any stray .mov anywhere)
+*.mov
+
+# Live control-panel runtime data (relay command queue + display state)
+remote/
+
+# Scratch / OS / editor junk
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
