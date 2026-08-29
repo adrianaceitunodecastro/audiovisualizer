@@ -44,6 +44,7 @@ html, body {
 }
 
 .intro-card {
+  position: relative;
   width: min(540px, 86vw);
   padding: 46px 40px 38px;
   border-radius: 22px;
@@ -53,6 +54,19 @@ html, body {
   text-align: center;
   transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
 }
+
+/* close (✕) — only meaningful when the picker is reopened over a running source */
+.intro-x {
+  position: absolute; top: 14px; right: 14px;
+  display: none; place-items: center;
+  width: 30px; height: 30px; border-radius: 9px;
+  font-family: inherit; font-size: 14px; line-height: 1;
+  color: var(--muted); background: rgba(255,255,255,.04);
+  border: 1px solid var(--glass-brd); cursor: pointer;
+  transition: color .18s, background .18s, border-color .18s;
+}
+.intro-x:hover { color: var(--fg); background: rgba(255,255,255,.08); border-color: var(--accent-2); }
+.intro.can-close .intro-x { display: grid; }
 .intro-card.dragover {
   transform: scale(1.02);
   border-color: var(--accent);
@@ -182,6 +196,19 @@ html, body {
 .kf-marks { position: absolute; left: 0; right: 0; top: 50%; height: 16px; transform: translateY(-50%); pointer-events: none; }
 .kf-mark { position: absolute; top: 0; width: 2px; height: 16px; margin-left: -1px; background: var(--accent-2); border-radius: 2px; box-shadow: 0 0 6px var(--accent-2); }
 
+/* live input has no song timeline — swap the scrubber for a LIVE indicator + elapsed clock */
+.controls.live .seek-bar,
+.controls.live .kf-marks { display: none; }
+.controls.live .seek-wrap { min-height: 20px; }
+.controls.live .seek-wrap::after {
+  content: "LIVE";
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  font-size: 11px; letter-spacing: 3px; color: var(--accent);
+  opacity: .85; pointer-events: none;
+}
+.controls.live #durTime { color: var(--accent); }
+
 .vol { display: flex; align-items: center; gap: 8px; color: var(--muted); flex: 0 0 auto; }
 
 /* range inputs */
@@ -205,21 +232,51 @@ input[type="range"]::-moz-range-thumb {
   background: var(--accent); box-shadow: 0 0 12px rgba(108,240,255,.6);
 }
 
-/* mode switch — show every scene (wraps to multiple rows) */
-.mode-switch {
-  display: flex; flex-wrap: wrap; justify-content: center; gap: 4px;
-  background: rgba(0,0,0,.25); padding: 4px; border-radius: 11px;
-  flex: 0 1 auto; max-width: 560px;
+/* scene picker — compact trigger + popup grid (scales as the list grows) */
+.scene-select { position: relative; flex: 0 0 auto; }
+.scene-btn {
+  display: flex; align-items: center; gap: 8px;
+  font-family: inherit; font-size: 12.5px; letter-spacing: 1px; font-weight: 600;
+  color: var(--fg); background: rgba(0,0,0,.25);
+  border: 1px solid transparent; border-radius: 11px;
+  padding: 9px 13px; cursor: pointer; white-space: nowrap;
+  transition: color .18s, background .18s, border-color .18s;
 }
+.scene-btn .scene-btn-tag { font-size: 9.5px; letter-spacing: 2px; color: var(--muted); font-weight: 700; }
+.scene-btn:hover { border-color: var(--glass-brd); }
+.scene-btn.open { color: #04121a; background: var(--accent); border-color: var(--accent); }
+.scene-btn.open .scene-btn-tag { color: rgba(4,18,26,.6); }
+.scene-btn .chev { transition: transform .18s; flex: 0 0 auto; }
+.scene-btn.open .chev { transform: rotate(180deg); }
+.mode-switch {
+  position: absolute; bottom: calc(100% + 12px); right: 0; z-index: 35;
+  display: grid; grid-template-columns: repeat(3, minmax(118px, 1fr)); gap: 3px;
+  width: max-content; max-width: min(480px, calc(100vw - 24px));
+  max-height: min(58vh, 540px); overflow-y: auto;
+  padding: 8px; border-radius: 14px;
+  background: var(--glass); border: 1px solid var(--glass-brd);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 20px 60px rgba(0,0,0,.55);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.mode-switch.hidden { transform: translateY(6px); }
+.mode-switch::-webkit-scrollbar { width: 8px; }
+.mode-switch::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 8px; }
 .mode-switch .m {
+  display: flex; align-items: center; gap: 9px; text-align: left;
   font-family: inherit; font-size: 12px; letter-spacing: .5px;
   color: var(--muted); background: transparent; border: none;
-  padding: 7px 12px; border-radius: 8px; cursor: pointer;
-  white-space: nowrap; flex: 0 0 auto;
+  padding: 8px 11px; border-radius: 8px; cursor: pointer;
+  white-space: nowrap;
   transition: color .18s, background .18s;
 }
-.mode-switch .m:hover { color: var(--fg); }
+.mode-switch .m .k {
+  font-size: 10px; font-variant-numeric: tabular-nums;
+  color: rgba(255,255,255,.30); min-width: 15px; text-align: right;
+}
+.mode-switch .m:hover { color: var(--fg); background: rgba(255,255,255,.06); }
 .mode-switch .m.active { color: #04121a; background: var(--accent); }
+.mode-switch .m.active .k { color: rgba(4,18,26,.55); }
 
 /* ---------- Logo & text panel ---------- */
 .panel {
@@ -309,6 +366,14 @@ input[type="range"]::-moz-range-thumb {
 .ov-row + .ov-row { border-top: 1px solid rgba(255,255,255,.06); }
 .ov-trig { flex: 0 0 auto !important; min-width: 36px; padding: 6px 9px !important; }
 .ov-row.playing .ov-trig { color: #04121a; background: var(--accent); border-color: var(--accent); box-shadow: 0 0 10px rgba(108,240,255,.45); }
+/* preload state dot: empty = cold, pulsing = warming, solid = ready, red = failed */
+.ov-state { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; box-sizing: border-box;
+  border: 1px solid rgba(255,255,255,.28); background: transparent; }
+.ov-state.ok { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 6px rgba(108,240,255,.5); }
+.ov-state.load { background: var(--muted); border-color: var(--muted); animation: ovWarm 1s ease-in-out infinite; }
+.ov-state.bad { background: var(--accent-2); border-color: var(--accent-2); }
+@keyframes ovWarm { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+.ov-warm { margin-top: 7px; font-size: 11px; color: var(--muted); }
 .ov-name { flex: 1; min-width: 0; font-size: 12px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ov-name b { color: var(--accent); font-weight: 600; margin-right: 3px; }
 .ov-mode { flex: 0 0 auto; font-size: 11px; padding: 5px 6px; }
@@ -421,7 +486,9 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 6px; }
 .chips button.active { color: #04121a; background: var(--accent); border-color: var(--accent); }
 
 @media (max-width: 720px) {
-  .vol, .mode-switch { display: none; }
+  .vol { display: none; }
+  .mode-switch { grid-template-columns: repeat(2, minmax(110px, 1fr)); right: auto; left: 50%; transform: translateX(-50%); }
+  .mode-switch.hidden { transform: translateX(-50%) translateY(6px); }
   .controls { gap: 10px; }
   .logo { font-size: 40px; letter-spacing: 10px; }
   .panel { right: 12px; left: 12px; width: auto; bottom: 88px; }

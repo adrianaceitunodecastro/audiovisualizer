@@ -39,6 +39,7 @@ if (is_dir($vjDir)) {
   <!-- Drop / load overlay -->
   <div id="intro" class="intro">
     <div class="intro-card" id="dropzone">
+      <button id="introClose" class="intro-x" type="button" aria-label="Keep current source" title="Keep current source">✕</button>
       <div class="logo">SONAR</div>
       <p class="tagline">Audio&nbsp;Visualizer</p>
       <div class="drop-hint">
@@ -54,7 +55,7 @@ if (is_dir($vjDir)) {
       </div>
       <input id="fileInput" type="file" accept=".wav,.wave,.mp3,.ogg,.oga,.opus,.flac,.m4a,.aac,audio/*" hidden />
     </div>
-    <p class="hint-keys">23 scenes · keys&nbsp;<b>1</b>–<b>9</b> + click · <b>S</b> smart shuffle · <b>space</b> play/pause · <b>F</b> fullscreen · <b>H</b> hide UI</p>
+    <p class="hint-keys">50 scenes · keys&nbsp;<b>1</b>–<b>9</b> + picker · <b>S</b> smart shuffle · <b>space</b> play/pause · <b>F</b> fullscreen · <b>H</b> hide UI</p>
     <p class="hint-keys" style="margin-top:8px">
       📱 <a id="ctrlLink" href="control.php" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">Open live control panel</a>
       &nbsp;·&nbsp; on your phone (same Wi-Fi): <b id="ctrlUrl">control.php</b>
@@ -92,30 +93,13 @@ if (is_dir($vjDir)) {
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M21 3l-7 7"/><path d="M16 21h5v-5"/><path d="M21 21L9 9"/><path d="M3 4l5 5"/><path d="M3 20l5-5"/></svg>
     </button>
 
-    <div class="mode-switch" id="modeSwitch">
-      <button data-mode="0" class="m active" type="button">Aurora</button>
-      <button data-mode="1" class="m" type="button">Spectrum</button>
-      <button data-mode="2" class="m" type="button">Tunnel</button>
-      <button data-mode="3" class="m" type="button">Galaxy</button>
-      <button data-mode="4" class="m" type="button">Synthwave</button>
-      <button data-mode="5" class="m" type="button">Kaleido</button>
-      <button data-mode="6" class="m" type="button">Liquid</button>
-      <button data-mode="7" class="m" type="button">Scope</button>
-      <button data-mode="8" class="m" type="button">Terrain</button>
-      <button data-mode="9" class="m" type="button">Rings</button>
-      <button data-mode="10" class="m" type="button">Rays</button>
-      <button data-mode="11" class="m" type="button">Matrix</button>
-      <button data-mode="12" class="m" type="button">Lissajous</button>
-      <button data-mode="13" class="m" type="button">Web</button>
-      <button data-mode="14" class="m" type="button">Vortex</button>
-      <button data-mode="15" class="m" type="button">Plasma</button>
-      <button data-mode="16" class="m" type="button">Strobe</button>
-      <button data-mode="17" class="m" type="button">Lasers</button>
-      <button data-mode="18" class="m" type="button">Pillars</button>
-      <button data-mode="19" class="m" type="button">Hypno</button>
-      <button data-mode="20" class="m" type="button">Siren</button>
-      <button data-mode="21" class="m" type="button">Glitch</button>
-      <button data-mode="22" class="m" type="button">Cassette</button>
+    <div class="scene-select" id="sceneSelect">
+      <button id="sceneBtn" class="scene-btn" type="button" aria-haspopup="listbox" aria-expanded="false" title="Choose scene (1–9 · PgUp/PgDn via key map)">
+        <span class="scene-btn-tag">SCENE</span>
+        <span id="sceneBtnLabel">AURORA</span>
+        <svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>
+      </button>
+      <div class="mode-switch hidden" id="modeSwitch" role="listbox" aria-label="Scenes"><!-- options built from NAMES in app.js --></div>
     </div>
 
     <button id="keysBtn" class="icon-btn" type="button" aria-label="Key map" title="Key map (live control)">
@@ -135,6 +119,9 @@ if (is_dir($vjDir)) {
     </button>
     <button id="overlaysBtn" class="icon-btn" type="button" aria-label="Overlays" title="Video overlays (VJ clips)">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 4v16M17 4v16M2 9h5M2 15h5M17 9h5M17 15h5"/></svg>
+    </button>
+    <button id="srcBtn" class="icon-btn" type="button" aria-label="Change audio source" title="Change audio source — file · live input · system audio">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h13l-3-3M20 17H7l3 3"/></svg>
     </button>
     <button id="loadBtn" class="icon-btn" type="button" aria-label="Load file" title="Load another track">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7-7 7 7"/></svg>
@@ -230,7 +217,7 @@ if (is_dir($vjDir)) {
       <button id="overlaysClose" class="x" type="button" aria-label="Close">✕</button>
     </div>
     <div class="panel-body">
-      <p class="panel-note">Launch video clips over the scene. Use <b>WebM with alpha</b> for transparency, or any MP4 — pick <b>Add</b>/<b>Screen</b> blend for light-on-black loops. The first 8 clips map to keys (bind them in the Key Map). DXV/ProRes aren't browser-playable — convert to WebM/MP4 first.</p>
+      <p class="panel-note">Launch video clips over the scene. Use <b>WebM with alpha</b> for transparency, or any MP4 — pick <b>Add</b>/<b>Screen</b> blend for light-on-black loops. The first 8 clips map to keys (bind them in the Key Map). DXV/ProRes aren't browser-playable — convert to WebM/MP4 first. Clips preload in the background so the first trigger is instant — the dot shows <b>cold</b> / <b>loading</b> / <b>ready</b>, and turns red if a clip can't be decoded.</p>
       <div class="row"><button id="ovAddBtn" class="mini-btn" type="button">Add clip(s)…</button></div>
       <input id="ovFile" type="file" accept="video/*,.webm,.mp4,.mov" multiple hidden />
       <div id="ovList" class="kf-list"></div>
@@ -324,6 +311,21 @@ if (is_dir($vjDir)) {
         <button id="mixSysBtn" class="mini-btn" type="button">System / tab audio</button>
       </div>
       <p class="panel-note">Pick a mic, line-in, or a virtual-cable device (VB-Cable / BlackHole) for loopback. "System / tab audio" shares output via the browser dialog — tick its audio box.</p>
+      <label class="field">
+        <span>Start temporizer <b id="liveFadeVal">Off</b></span>
+        <input id="liveFadeRange" type="range" min="0" max="15" step="0.5" value="0" />
+      </label>
+      <p class="panel-note">Fades the visuals up from black over this many seconds when a live input starts (0 = off).</p>
+
+      <div class="sec-label">Performance</div>
+      <label class="field">
+        <span>Max FPS <b id="maxFpsVal">Uncapped</b></span>
+        <input id="maxFpsRange" type="range" min="0" max="60" step="5" value="0" />
+      </label>
+      <label class="field">
+        <span>Render scale <b id="renderScaleVal">100%</b></span>
+        <input id="renderScaleRange" type="range" min="50" max="100" step="5" value="100" />
+      </label>
 
       <div class="sec-label">Reactivity</div>
       <label class="field">

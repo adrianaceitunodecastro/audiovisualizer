@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#04050a">
+<!-- launched from the home screen these drop the browser chrome entirely —
+     the only way to get a chromeless deck on iOS, which has no element fullscreen -->
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SONAR DECK">
 <title>SONAR · DECK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -60,6 +66,20 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
   font:700 11px/1 "Orbitron",sans-serif;letter-spacing:1px;padding:9px 12px;border-radius:11px;cursor:pointer;
 }
 .hud .pill.on{color:#04121a;background:var(--accent);border-color:var(--accent);box-shadow:0 0 16px color-mix(in srgb,var(--accent) 55%,transparent)}
+.hud .pill.fs{padding:9px 10px;font-size:15px;line-height:1;margin-left:-4px}
+.hud .pill.fs.hide{display:none}
+
+/* ---------- toast ---------- */
+.toast{
+  position:fixed;left:50%;transform:translate(-50%,-14px);
+  top:calc(var(--hud) + env(safe-area-inset-top) + 10px);z-index:60;
+  max-width:min(88vw,420px);padding:11px 15px;border-radius:13px;
+  border:1px solid var(--line);background:linear-gradient(160deg,rgba(30,36,56,.96),rgba(12,15,26,.96));
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  font-size:12.5px;line-height:1.4;color:var(--ink);text-align:center;
+  box-shadow:0 12px 34px rgba(0,0,0,.5);
+  opacity:0;pointer-events:none;transition:opacity .22s ease,transform .22s ease}
+.toast.show{opacity:1;transform:translate(-50%,0)}
 
 /* ---------- stage ---------- */
 #stage{position:fixed;left:0;right:0;
@@ -183,7 +203,9 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
       <div class="sub" id="nowSub">connecting…</div>
     </div>
     <button class="pill" id="shufPill">SHUF</button>
+    <button class="pill fs" id="fsBtn" aria-label="Pantalla completa" title="Pantalla completa">⛶</button>
   </header>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <main id="stage">
     <!-- SCENES -->
@@ -276,11 +298,98 @@ function send(action,value){ vibe(8);
 
 let S={};
 
+/* ---- fullscreen ----------------------------------------------------------
+   The deck should own the whole phone screen. Fullscreen can only be entered
+   from a user gesture, so instead of firing on load (which browsers reject) we
+   arm it and go on the first tap — without swallowing that tap, so it still
+   does whatever it was going to do.
+   iOS Safari has no element fullscreen at all; there the only chromeless mode
+   is Add to Home Screen, so we say that outright rather than failing silently.
+   Exiting via our own button is remembered — we don't fight the user — but an
+   exit by system gesture (notification pull-down, back swipe) re-arms. */
+const fsEl=document.documentElement;
+const fsSupported=!!(fsEl.requestFullscreen||fsEl.webkitRequestFullscreen);
+const mq=q=>!!(window.matchMedia&&window.matchMedia(q).matches);
+const isStandalone=navigator.standalone===true||mq('(display-mode: standalone)');
+const touchUI=mq('(pointer:coarse)')||/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const isFS=()=>!!(document.fullscreenElement||document.webkitFullscreenElement);
+let fsWanted=false;
+try{fsWanted=localStorage.getItem('sonar.deck.fs')!=='0';}catch(e){fsWanted=true;}
+
+let toastT=0;
+function toast(msg,ms){
+  const t=$('#toast'); if(!t) return;
+  t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'),ms||4200);
+}
+
+function enterFS(){
+  if(isFS()||!fsSupported) return;
+  try{
+    const r=fsEl.requestFullscreen?fsEl.requestFullscreen({navigationUI:'hide'}):fsEl.webkitRequestFullscreen();
+    if(r&&r.catch) r.catch(()=>{});
+  }catch(e){}
+}
+function leaveFS(){
+  if(!isFS()) return;
+  try{const r=document.exitFullscreen?document.exitFullscreen():document.webkitExitFullscreen();if(r&&r.catch)r.catch(()=>{});}catch(e){}
+}
+
+// fire on the next tap anywhere; capture phase so it runs first, but it never
+// preventDefaults — the tap still hits the pad/fader underneath
+let fsArmed=false;
+function armFS(){
+  if(fsArmed||!fsWanted||!fsSupported||!touchUI||isFS()) return;
+  fsArmed=true;
+  // isTrusted only — the tab-restore below fires a synthetic click on load,
+  // and letting that consume the arm would burn the real first tap
+  const go=(e)=>{if(e&&!e.isTrusted)return;disarmFS();enterFS();};
+  const disarmFS=()=>{fsArmed=false;
+    document.removeEventListener('pointerdown',go,true);
+    document.removeEventListener('click',go,true);};
+  document.addEventListener('pointerdown',go,true);
+  document.addEventListener('click',go,true);
+}
+
+function syncFS(){
+  const b=$('#fsBtn'); if(!b) return;
+  const on=isFS();
+  b.classList.toggle('on',on);     // accent fill carries the state; the glyph stays put
+  b.title=on?'Salir de pantalla completa':'Pantalla completa';
+  // already chromeless from the home screen, or a desktop browser → no point
+  b.classList.toggle('hide',isStandalone||(!fsSupported&&!touchUI));
+}
+
+$('#fsBtn').addEventListener('click',()=>{
+  vibe(6);
+  if(isFS()){
+    fsWanted=false; try{localStorage.setItem('sonar.deck.fs','0');}catch(e){}
+    leaveFS();
+  }else{
+    fsWanted=true; try{localStorage.setItem('sonar.deck.fs','1');}catch(e){}
+    if(fsSupported) enterFS();
+    else if(isStandalone) toast('Ya estás en modo app — sin barras del navegador.');
+    else toast('iOS no permite pantalla completa en Safari. Usa Compartir → “Añadir a pantalla de inicio” y abre DECK desde el icono: se verá sin barras.',7000);
+  }
+});
+
+['fullscreenchange','webkitfullscreenchange'].forEach(ev=>
+  document.addEventListener(ev,()=>{
+    syncFS();
+    // dropped out but we still want it (system gesture) → catch the next tap
+    if(!isFS()&&fsWanted) armFS();
+  }));
+
+syncFS(); armFS();
+
 /* ---- optimistic overrides: keep a just-tapped value for ~650ms so a stale
    poll can't bounce it back before the display echoes the new state ---- */
 const ovStore={};
 const pSet=(o,p,v)=>{const k=p.split('.');let c=o;for(let i=0;i<k.length-1;i++)c=c[k[i]]=c[k[i]]||{};c[k[k.length-1]]=v;};
-function mark(path,value){ pSet(S,path,value); ovStore[path]={v:value,until:performance.now()+650}; }
+const pGet=(o,p)=>p.split('.').reduce((c,k)=>(c==null?undefined:c[k]),o);
+const eqv=(a,b)=>(typeof a==='number'&&typeof b==='number')?Math.abs(a-b)<1e-6:a===b;
+// hold the just-tapped value until the display CONFIRMS it (or 2.5s fallback) → no bounce
+function mark(path,value){ pSet(S,path,value); ovStore[path]={v:value,until:performance.now()+2500}; }
 function opt(path,value){ mark(path,value); render(); }
 
 /* ---- tabs + per-section accent ---- */
@@ -396,28 +505,36 @@ function render(){
   setF(pMid,'#vMid',S.eqMid,v=>Math.round(v*100)+'%');
   setF(pTreb,'#vTreb',S.eqTreble,v=>Math.round(v*100)+'%');
   setF(pSens,'#vSens',S.beatSens,v=>(+v).toFixed(1));
-  // fx
-  $('#blackoutBtn').classList.toggle('live',!!S.blackout);
-  $('#whiteoutBtn').classList.toggle('live',!!S.whiteout);
+  // fx — blackout/whiteout 'live' is owned by the press (holdBtn), not polled state (avoids flicker)
   $('#blurBtn').classList.toggle('on',S.blur>0);
   $('#hueBtn').classList.toggle('on',!!S.hue);
   $('#strobeBtn').classList.toggle('on',S.strobe&&S.strobe!=='off');
   $('#strobeBtn').querySelector('.ic').nextSibling.textContent='STROBE'+(S.strobe&&S.strobe!=='off'?' · '+S.strobe.toUpperCase():'');
 }
 
-/* ---- poll state ---- */
-let lastOk=0;
+/* ---- poll state (long-poll: the server holds the request until the display
+        publishes something new; degrades to 250ms polling under php -S) ---- */
+let lastOk=0,sig='';
 async function poll(){
-  try{const j=await(await fetch(RELAY+'?channel=state',{cache:'no-store'})).json();
-    if(j&&j.names){S=j;const now=performance.now();
-      for(const p in ovStore){ if(now<ovStore[p].until) pSet(S,p,ovStore[p].v); else delete ovStore[p]; }
-      lastOk=now;render();}}catch(e){}
-  const live=performance.now()-lastOk<2500;
+  const t0=performance.now();let ok=false;
+  try{const r=await(await fetch(RELAY+'?channel=state&wait=20&sig='+encodeURIComponent(sig),{cache:'no-store'})).json();
+    ok=true;
+    if(r&&r.sig!==undefined&&r.sig!==sig){sig=r.sig;const j=r.state;
+      if(j&&j.names){const now=performance.now();
+        for(const p in ovStore){ const o=ovStore[p];
+          if(eqv(pGet(j,p),o.v) || now>o.until) delete ovStore[p];   // display confirmed it (or timed out) → release
+          else pSet(j,p,o.v); }                                       // still pending → keep our optimistic value
+        S=j;lastOk=now;render();}}}catch(e){}
+  const held=performance.now()-t0>1000;
+  setTimeout(poll, ok?(held?0:250):1000);
+}
+poll();
+// connection orb on its own clock — a held long-poll must not freeze it
+setInterval(()=>{const live=performance.now()-lastOk<2500;
   $('#orb').classList.toggle('on',live);
   $('#connTxt').textContent=live?'LIVE':'OFF';
   if(!live)$('#nowSub').textContent='sin pantalla — abre el visualizador en el PC';
-}
-poll(); setInterval(poll,250);
+},400);
 </script>
 </body>
 </html>

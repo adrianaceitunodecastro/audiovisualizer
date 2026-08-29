@@ -12,6 +12,7 @@ const dropzone = $('dropzone');
 const fileInput = $('fileInput');
 const micBtn = $('micBtn');
 const sysBtn = $('sysBtn');
+const introClose = $('introClose');
 const inputDevice = $('inputDevice');
 const mixMicBtn = $('mixMicBtn');
 const mixSysBtn = $('mixSysBtn');
@@ -28,7 +29,9 @@ const durTime = $('durTime');
 const vol = $('vol');
 const shuffleBtn = $('shuffleBtn');
 const modeSwitch = $('modeSwitch');
+const sceneSelect = $('sceneSelect'), sceneBtn = $('sceneBtn'), sceneBtnLabel = $('sceneBtnLabel');
 const loadBtn = $('loadBtn');
+const srcBtn = $('srcBtn');
 const fsBtn = $('fsBtn');
 const recBtn = $('recBtn');
 const recBadge = $('recBadge');
@@ -61,6 +64,9 @@ const strobeSeg = $('strobeSeg');
 const transType = $('transType'), transDurRange = $('transDurRange'), transDurVal = $('transDurVal');
 const fadeInRange = $('fadeInRange'), fadeInVal = $('fadeInVal');
 const fadeOutRange = $('fadeOutRange'), fadeOutVal = $('fadeOutVal');
+const liveFadeRange = $('liveFadeRange'), liveFadeVal = $('liveFadeVal');
+const maxFpsRange = $('maxFpsRange'), maxFpsVal = $('maxFpsVal');
+const renderScaleRange = $('renderScaleRange'), renderScaleVal = $('renderScaleVal');
 const bgType = $('bgType'), bgC1 = $('bgC1'), bgC2 = $('bgC2'), bgImgBtn = $('bgImgBtn'), bgImgClear = $('bgImgClear'), bgImg = $('bgImg');
 const sceneSave = $('sceneSave'), sceneLoadBtn = $('sceneLoadBtn'), sceneFile = $('sceneFile');
 // lyrics panel
@@ -142,16 +148,21 @@ let bctx = bloom.getContext('2d');
 
 let W = 0, H = 0, CX = 0, CY = 0, DPR = 1;
 
+// live performance controls: render scale <1 lowers internal resolution;
+// maxFps>0 caps the render loop. Both trade fidelity for CPU/GPU headroom next to FL.
+let renderScale = 1, maxFps = 0;
+
 function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const PR = DPR * renderScale;
   W = window.innerWidth;
   H = window.innerHeight;
   CX = W / 2; CY = H / 2;
-  for (const c of [stage, scene]) { c.width = W * DPR; c.height = H * DPR; }
-  bloom.width = Math.floor(W * DPR / 2);
-  bloom.height = Math.floor(H * DPR / 2);
-  for (const cc of [ctx, sctx]) cc.setTransform(DPR, 0, 0, DPR, 0, 0);
-  bctx.setTransform(DPR / 2, 0, 0, DPR / 2, 0, 0);
+  for (const c of [stage, scene]) { c.width = Math.max(1, Math.round(W * PR)); c.height = Math.max(1, Math.round(H * PR)); }
+  bloom.width = Math.max(1, Math.floor(W * PR / 2));
+  bloom.height = Math.max(1, Math.floor(H * PR / 2));
+  for (const cc of [ctx, sctx]) cc.setTransform(PR, 0, 0, PR, 0, 0);
+  bctx.setTransform(PR / 2, 0, 0, PR / 2, 0, 0);
   buildStars();
 }
 window.addEventListener('resize', resize);
@@ -202,6 +213,7 @@ function loadFile(file) {
   mediaSrc = actx.createMediaElementSource(audioEl);
   routeSource(mediaSrc, true);           // file plays through the speakers
   isMic = false;
+  pluginActive = false;                  // plugin: a loaded file drives the visuals, not FL's live audio
 
   audioEl.addEventListener('loadedmetadata', () => {
     durTime.textContent = fmt(audioEl.duration);
@@ -241,6 +253,7 @@ async function useMic(deviceId) {
   const lbl = inputDevice.selectedOptions[0] && inputDevice.selectedOptions[0].textContent;
   trackName.textContent = '◉ ' + (deviceId && lbl ? lbl : 'Live Input');
   durTime.textContent = '∞';
+  startLiveFade();
   reveal(); startLoop(); setPlayIcon(true);
   populateDevices();
 }
@@ -265,6 +278,7 @@ async function useSystemAudio() {
   stream.getAudioTracks()[0].addEventListener('ended', () => setPlayIcon(false));
   trackName.textContent = '◉ System / Tab Audio';
   durTime.textContent = '∞';
+  startLiveFade();
   reveal(); startLoop(); setPlayIcon(true);
 }
 
@@ -290,10 +304,12 @@ async function populateDevices() {
 /* ---------- Transport ---------- */
 let seeking = false;
 let started = false;
+let liveStartMs = 0;   // wall-clock start of the current live input (0 = not live)
 
 function play() {
   if (isMic) return;
   if (actx.state === 'suspended') actx.resume();
+  if (post.liveFade > 0 && audioEl && audioEl.currentTime < 0.05) startLiveFade();   // temporizer intro on start
   audioEl.play();
   setPlayIcon(true);
   startLoop();
@@ -313,8 +329,20 @@ function setPlayIcon(playing) {
 function reveal() {
   started = true;
   intro.classList.add('hidden');
+  intro.classList.remove('can-close');
   topbar.classList.remove('hidden');
   controls.classList.remove('hidden');
+}
+
+// re-open the input picker to switch source (file · live input · system audio).
+// once a source is already running it becomes dismissable so it's not a trap.
+function openIntro() {
+  intro.classList.toggle('can-close', started);
+  intro.classList.remove('hidden');
+  populateDevices();   // refresh the mix-panel device list while we're at it
+}
+function closeIntro() {
+  if (started) intro.classList.add('hidden');   // pre-start there's no source to keep — leave it up
 }
 
 function fmt(s) {
@@ -384,9 +412,117 @@ function computeBands() {
 }
 
 function analyze() {
+  if (pluginActive) { pluginAnalyzer(); return; }   // host-fed PCM (FL Studio / VST3 plugin)
   analyser.getByteFrequencyData(freq);
   analyser.getByteTimeDomainData(time);
   computeBands();
+}
+
+/* =====================================================================
+   PLUGIN (FL STUDIO / VST3) MODE
+   The host feeds us PCM over the JUCE WebView bridge — there is no Web Audio
+   graph here. We mirror the offline analyzer: window → FFT → freq/time → bands,
+   so the visuals react exactly as they do to a file or the AnalyserNode.
+   ===================================================================== */
+const IN_PLUGIN = !!window.SONAR_PLUGIN;
+let pluginActive = false;
+let pluginPCM = null;          // latest host audio window (Float32Array, fftSize)
+let pluginAnalyzer = null;     // fills freq/time + bands from pluginPCM each frame
+
+function makePluginAnalyzer() {
+  const N = 2048;
+  const hann = new Float32Array(N);
+  for (let i = 0; i < N; i++) hann[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+  const re = new Float32Array(N), im = new Float32Array(N), smooth = new Float32Array(N / 2);
+  const minDb = -90, maxDb = -10, sm = 0.82;    // match the live AnalyserNode config
+  return function () {
+    const src = pluginPCM;
+    for (let i = 0; i < N; i++) {
+      const s = src ? src[i] : 0;
+      re[i] = s * hann[i]; im[i] = 0;
+      time[i] = Math.max(0, Math.min(255, Math.round(128 + s * 128)));
+    }
+    fft(re, im);
+    for (let k = 0; k < N / 2; k++) {
+      let mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]) / N;
+      mag = sm * smooth[k] + (1 - sm) * mag; smooth[k] = mag;
+      const db = 20 * Math.log10(mag || 1e-12);
+      freq[k] = Math.max(0, Math.min(255, Math.round(255 * (db - minDb) / (maxDb - minDb))));
+    }
+    computeBands();
+  };
+}
+
+function initPlugin() {
+  const N = 2048;
+  freq = new Uint8Array(N / 2);          // 1024 bins, as the AnalyserNode would give
+  time = new Uint8Array(N);
+  pluginPCM = new Float32Array(N);
+  pluginAnalyzer = makePluginAnalyzer();
+  pluginActive = true;
+  isMic = true;                          // live source: wall-clock shuffle, ∞ length, no seeking
+  currentFile = null;
+  trackName.textContent = '◉ FL Studio';
+  durTime.textContent = '∞';
+  reveal(); setPlayIcon(true); startLoop();
+  subscribeHostAudio();
+}
+
+// switch back to reacting to FL's live audio (after a file was loaded for export)
+function useFLAudio() {
+  if (audioEl) audioEl.pause();
+  if (actx && gain) { try { gain.gain.cancelScheduledValues(actx.currentTime); gain.gain.value = vol.value / 100; } catch (e) {} }
+  pluginActive = true;
+  isMic = true;
+  currentFile = null;
+  trackName.textContent = '◉ FL Studio';
+  durTime.textContent = '∞';
+  seek.value = 0;
+  setPlayIcon(true);
+  startLoop();
+}
+
+// wire up the C++ <-> WebView bridge: audio in, transport reflect, preset load,
+// and host-project state restore. Retries until window.__JUCE__ is injected.
+function subscribeHostAudio() {
+  const attach = () => {
+    const be = window.__JUCE__ && window.__JUCE__.backend;
+    if (!be) return false;
+    be.addEventListener('audio', (b64) => {
+      const bin = atob(b64), n = bin.length;
+      const u8 = new Uint8Array(n);
+      for (let i = 0; i < n; i++) u8[i] = bin.charCodeAt(i);
+      const f = new Float32Array(u8.buffer);
+      if (pluginPCM && f.length === pluginPCM.length) pluginPCM.set(f);
+      else pluginPCM = f;
+    });
+    be.addEventListener('hostTransport', (d) => { if (pluginActive) setPlayIcon(!!(d && d.playing)); });
+    be.addEventListener('loadPresetResult', (json) => { try { applyScene(JSON.parse(json)); } catch (e) {} });
+    be.addEventListener('presetJson', (json) => { try { applyScene(JSON.parse(json)); } catch (e) {} });   // host project restore
+    emitToHost('uiReady', {});                     // ask C++ to push any stored project state
+    document.addEventListener('input', pluginMarkDirty, true);
+    document.addEventListener('change', pluginMarkDirty, true);
+    return true;
+  };
+  if (!attach()) window.addEventListener('load', attach);
+}
+
+function emitToHost(name, payload) {
+  const be = window.__JUCE__ && window.__JUCE__.backend;
+  if (be) be.emitEvent(name, payload);
+}
+function hostTransport(action) { emitToHost('transportControl', { action }); }
+function hostLoadPreset() { emitToHost('loadPreset', {}); }
+function pluginSaveBlob(blob, name) {
+  const r = new FileReader();
+  r.onload = () => emitToHost('saveFile', { name, mime: blob.type || '', data: (String(r.result).split(',')[1] || '') });
+  r.readAsDataURL(blob);
+}
+// debounced push of the full scene JSON to C++ so the FL project remembers it
+let _stateTimer = 0;
+function pluginMarkDirty() {
+  clearTimeout(_stateTimer);
+  _stateTimer = setTimeout(() => { try { emitToHost('stateChanged', JSON.stringify(collectScene())); } catch (e) {} }, 1500);
 }
 
 /* =====================================================================
@@ -397,11 +533,11 @@ let frame = 0;
 const TAU = Math.PI * 2;
 
 // post-FX + timing (Wave 1)
-const post = { blur: 0, flashW: 0, flashB: 0, beatStrobe: 'off', fadeIn: 0, fadeOut: 0 };
+const post = { blur: 0, flashW: 0, flashB: 0, beatStrobe: 'off', fadeIn: 0, fadeOut: 0, liveFade: 0 };
 const holdFlash = { white: false, black: false };   // momentary strobe while a key is held
 let renderTime = 0, renderDur = 0, headroom = 0;
 
-function isPlaying() { return offlineActive || isMic || (audioEl && !audioEl.paused); }
+function isPlaying() { return offlineActive || pluginActive || isMic || (audioEl && !audioEl.paused); }
 
 function fadeAlpha() {
   if (!renderDur) return 0;
@@ -410,6 +546,31 @@ function fadeAlpha() {
   if (post.fadeIn > 0 && renderTime < post.fadeIn) a = Math.max(a, 1 - renderTime / post.fadeIn);
   if (post.fadeOut > 0 && renderTime > renderDur - post.fadeOut) a = Math.max(a, (renderTime - (renderDur - post.fadeOut)) / post.fadeOut);
   return Math.min(1, Math.max(0, a));
+}
+
+// wall-clock fade-up from black for live inputs (mic / system). The song-clock
+// fadeIn above needs a timeline, which live sources don't have — so this runs
+// off performance.now(). Armed by the "Start temporizer" control and triggered
+// the moment an input goes live.
+let liveFadeStart = 0;               // performance.now() when the fade began (0 = idle)
+function startLiveFade() {
+  if (post.liveFade <= 0) { liveFadeStart = 0; return; }
+  liveFadeStart = performance.now();                       // visual fade up from black
+  // audio fade-in: ramp the monitor gain 0 → current volume over the same window
+  if (!pluginActive && actx && gain) {
+    const target = Math.max(0.0001, vol.value / 100), t0 = actx.currentTime;
+    try {
+      gain.gain.cancelScheduledValues(t0);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.linearRampToValueAtTime(target, t0 + post.liveFade);
+    } catch (e) {}
+  }
+}
+function liveFadeAlpha() {
+  if (!liveFadeStart) return 0;
+  const t = (performance.now() - liveFadeStart) / 1000;
+  if (t >= post.liveFade) { liveFadeStart = 0; return 0; }
+  return 1 - t / post.liveFade;      // 1 (full black) → 0 (normal)
 }
 
 // transient state for the extra scenes
@@ -422,6 +583,36 @@ let vortexRot = 0;
 let cassetteImg = null;        // CassetteRemix.svg, loaded at init
 let reelSpin = 0;              // shared reel rotation (cassette scene)
 let cassRayRot = 0;            // backdrop light-ray rotation (cassette scene)
+let fireflies = [];            // glow-mote swarm (fireflies scene)
+let jellies = [], jellyBubbles = [];   // jellyfish scene
+let helixRot = 0;              // double-helix rotation
+let radarRot = 0, radarBlips = [];     // radar sweep + contacts
+let cityBlds = [], cityW = 0, cityBolt = 0;  // skyline buildings (rebuilt on resize) + lightning
+let fwRockets = [], fwSparks = [];     // fireworks
+let emberParts = [];           // inferno embers
+let orbitBodies = [];          // orbits planets
+let bunkerRot = 0, bunkerSmoke = [];   // bunker fan spin + smoke plumes
+let bunkerFail = 0, bunkerChains = []; // bunker light-failure countdown + hanging chains
+let pressRam = 0, pressDrop = false, pressImpact = 0, pressSparks = [], pressSteam = [], pressBeacon = 0;  // press scene
+let boFlash = 0, boPattern = 0, boSeed = 1;            // blackout strobe energy / pattern / per-flash seed
+let teslaArcs = [], teslaSparks = [];                  // tesla bolts + dripping embers
+let shaftZ = 0, shaftShake = 0;                        // shaft descent distance + impact shake
+let monoCracks = [], monoDust = [], monoSpall = [];    // monolith fissures / drifting dust / spall chips
+let grindRot = 0, grindJolt = 0, grindSparks = [], grindShav = [];  // grinder gears + debris
+let sentX = 0, sentDir = 1, sentLock = 0, sentTarget = 0.5, sentFlare = 0;  // sentinel eye sweep / lock-on
+let razorSeams = [], razorDrops = [], razorShear = null;            // razor cuts / molten drips / frame shear
+/* --- TUNOX block (modes 40-49) --- */
+let sigilGlyph = null, sigilRot = 0, sigilFlash = 0, sigilAsh = [];  // sigil glyph / spin / rewrite flash / ash
+let thornVines = [], thornFlash = 0;                                 // thorns creeping in from the edge
+let cruPour = 0, cruShake = 0, cruSplash = [], cruSmoke = [];        // crucible pour / ladle shake / splash / smoke
+let hookRows = [], hookW = 0, hookSwing = 0, hookFlash = 0;          // hanging chains (rebuilt on resize) + backlight
+let ritRot = 0, ritPulse = 0, ritRings = [], ritMotes = [];          // ritual circle spin / kick pulse / shock rings / ash
+let veinNet = null, veinW = 0, veinH = 0, veinPulses = [];           // vein network (rebuilt on resize) + blood pulses
+let cathDust = [], cathFlash = 0, cathSway = 0;                      // cathedral dust / strobe / colonnade sway
+let bwCoils = [], bwSparks = [], bwFlash = 0;                        // razorwire coils / break sparks / snap flash
+let rustBlooms = [], rustFlakes = [], rustW = 0;                     // corrosion blooms (rebuilt on resize) + flakes
+let rustHit = 0, rustHitX = 0.5, rustHitY = 0.5, rustSweep = 0;      // hammer blow + inspection lamp
+let hexCols = [], hexW = 0, hexTear = 0, hexLock = 0;                // datastream columns / frame tear / name lock-in
 
 /* --- starfield --- */
 let stars = [];
@@ -990,12 +1181,110 @@ const overlays = {
   autoUntil: 0,         // song time to auto-clear at
 };
 
+/* ---- clip warming -------------------------------------------------------
+   A cold <video> costs a fetch + demux + decode on its first play(), which
+   lands as a visible stall the first time a clip is triggered — exactly the
+   wrong moment. So we warm clips ahead of time: load each one until its first
+   frame is decoded (readyState >= HAVE_CURRENT_DATA), then stop.
+   Deliberately NOT a blanket preload='auto': the library can be gigabytes, and
+   we only need the head of each file to make play() instant. Server clips get
+   dropped back to 'metadata' once warm so the browser stops pulling the rest.
+   Warming runs a couple at a time in the background, key-mapped clips first,
+   and anything the pointer touches jumps the queue. */
+const WARM_CONCURRENCY = 2;
+let warmQueue = [], warmActive = 0, warmRenderT = 0;
+
+// warming fires a lot of small state changes; coalesce them so we aren't
+// rebuilding the clip list's innerHTML out from under a click
+function scheduleOverlayRender() {
+  if (warmRenderT) return;
+  warmRenderT = setTimeout(() => { warmRenderT = 0; renderOverlays(); }, 120);
+}
+
+function warmOverlay(s) {
+  if (!s || !s.video || s.ready || s.failed) return Promise.resolve();
+  if (s._warm) return s._warm;
+  const v = s.video;
+  s.warming = true; scheduleOverlayRender();
+  s._warm = (v.dataset.lazySrc ? ensureOvSrc(v) : Promise.resolve()).then(() => new Promise(res => {
+    const finish = (ok) => {
+      v.removeEventListener('loadeddata', onOk);
+      v.removeEventListener('error', onErr);
+      s.warming = false;
+      if (ok) {
+        s.ready = true;
+        // enough to start instantly — tell the browser to stop fetching the
+        // rest of a big server clip until it's actually played
+        if (s.server) { try { v.preload = 'metadata'; } catch (e) {} }
+      } else s.failed = true;
+      scheduleOverlayRender(); res();
+    };
+    const onOk = () => finish(true), onErr = () => finish(false);
+    if (v.readyState >= 2) return finish(true);      // already decoded a frame
+    v.addEventListener('loadeddata', onOk);
+    v.addEventListener('error', onErr);
+    // If this clip has already been triggered, play() is driving the load —
+    // calling load() here would abort it. Just watch and let it come up.
+    const live = overlays.active >= 0 && overlays.slots[overlays.active] === s;
+    try { v.preload = 'auto'; if (!live) v.load(); } catch (e) { finish(false); }
+  }));
+  return s._warm;
+}
+
+// queue by id, not index — deleting a clip shifts every index after it
+function queueWarm(id, front) {
+  const s = overlays.slots.find(x => x.id === id);
+  if (!s || s.ready || s.failed || s.warming) return;
+  const at = warmQueue.indexOf(id);
+  if (at >= 0) { if (!front) return; warmQueue.splice(at, 1); }
+  front ? warmQueue.unshift(id) : warmQueue.push(id);
+  pumpWarm();
+}
+function pumpWarm() {
+  while (warmActive < WARM_CONCURRENCY && warmQueue.length) {
+    const id = warmQueue.shift();
+    const s = overlays.slots.find(x => x.id === id);
+    if (!s || s.ready || s.failed) continue;
+    warmActive++;
+    warmOverlay(s).then(pumpDone, pumpDone);
+  }
+}
+function pumpDone() { warmActive--; pumpWarm(); }
+
+// warm the whole bank in the background; the 8 key-mapped slots go first
+// because those are the ones fired blind in the middle of a set
+function warmAllOverlays() {
+  const idx = overlays.slots.map((_, i) => i);
+  idx.sort((a, b) => (a < 8 ? 0 : 1) - (b < 8 ? 0 : 1) || a - b);
+  for (const i of idx) queueWarm(overlays.slots[i].id);
+}
+const idle = window.requestIdleCallback || (fn => setTimeout(fn, 200));
+
 function makeOvVideo(url, preload) {
   const v = document.createElement('video');
-  v.src = url; v.muted = true; v.playsInline = true; v.loop = false;
+  v.muted = true; v.playsInline = true; v.loop = false;
   v.preload = preload || 'auto';                 // server clips use 'none' so big files don't prefetch
-  if (v.preload !== 'none') v.load();
+  if (IN_PLUGIN && url && !url.startsWith('blob:')) {
+    // In the plugin the page is served over a custom WebView scheme that can't
+    // satisfy the HTTP range requests <video> needs — so fetch the clip and play
+    // it from an in-memory blob instead. Done lazily, on first trigger.
+    v.dataset.lazySrc = url;
+  } else {
+    v.src = url;
+    if (v.preload !== 'none') v.load();
+  }
   return v;
+}
+
+// plugin: resolve a lazy server clip to a playable blob URL (once)
+function ensureOvSrc(v) {
+  if (!v.dataset.lazySrc) return Promise.resolve();
+  if (!v._srcPromise) {
+    v._srcPromise = fetch(v.dataset.lazySrc).then(r => r.blob()).then(b => {
+      v.src = URL.createObjectURL(b); delete v.dataset.lazySrc; v.load();
+    }).catch(() => {});
+  }
+  return v._srcPromise;
 }
 
 // add the clips PHP found in /vjloops — streamed by URL, not stored in IndexedDB.
@@ -1011,6 +1300,7 @@ function initServerClips() {
   const list = Array.isArray(window.VJLOOPS) ? window.VJLOOPS : [];
   for (const entry of list) addServerClip(entry);
   renderOverlays();
+  idle(warmAllOverlays);          // start warming once the page has settled
 }
 
 function overlayStart(i) {
@@ -1021,12 +1311,27 @@ function overlayStart(i) {
   const v = s.video;
   v.loop = (s.mode === 'loop');
   v.onended = (s.mode === 'once') ? () => { if (overlays.active === i) { overlays.active = -1; renderOverlays(); } } : null;
-  try { v.currentTime = 0; } catch (e) {}
-  v.play().catch(() => {});
+  // overlayStop already rewound it, so skip a redundant seek on the hot path
+  const go = () => {
+    if (overlays.active !== i) return;
+    try { if (v.currentTime > 0.05) v.currentTime = 0; } catch (e) {}
+    v.play().catch(() => {});
+  };
+  // it's playing now, so drop it from the background queue and track its
+  // load state directly (warmOverlay won't touch load() on the live clip)
+  const q = warmQueue.indexOf(s.id); if (q >= 0) warmQueue.splice(q, 1);
+  if (!s.ready && !s.failed) warmOverlay(s);
+  if (v.dataset.lazySrc) ensureOvSrc(v).then(go); else go();   // plugin server clips fetch-to-blob first
   renderOverlays();
 }
 function overlayStop(i) {
-  const s = overlays.slots[i]; if (s && s.video) s.video.pause();
+  const s = overlays.slots[i];
+  if (s && s.video) {
+    s.video.pause();
+    // rewind now, while nothing is waiting on it — a seek at trigger time is
+    // the other half of the first-play stall
+    try { s.video.currentTime = 0; } catch (e) {}
+  }
   if (i == null || overlays.active === i) { overlays.active = -1; overlays.autoActive = false; }
   renderOverlays();
 }
@@ -1040,6 +1345,7 @@ async function addOverlayClip(file) {
   const url = URL.createObjectURL(file);
   overlays.slots.push({ id, name: file.name, url, video: makeOvVideo(url), mode: 'loop' });
   renderOverlays();
+  queueWarm(id);
 }
 async function loadOverlays() {
   let items = []; try { items = await idbAll('overlays'); } catch (e) { return; }
@@ -1048,11 +1354,13 @@ async function loadOverlays() {
     overlays.slots.push({ id: it.id, name: it.name, url, video: makeOvVideo(url), mode: it.mode || 'loop' });
   }
   renderOverlays();
+  idle(warmAllOverlays);
 }
 async function deleteOverlay(id) {
   const idx = overlays.slots.findIndex(s => s.id === id); if (idx < 0) return;
   const s = overlays.slots[idx];
   if (overlays.active === idx) overlayStop(idx);
+  const q = warmQueue.indexOf(id); if (q >= 0) warmQueue.splice(q, 1);
   if (s.video) { s.video.pause(); s.video.src = ''; }
   if (s.url && !s.server) URL.revokeObjectURL(s.url);     // server clips are plain URLs, not blob URLs
   overlays.slots.splice(idx, 1);
@@ -1069,9 +1377,14 @@ async function setOverlayMode(id, mode) {
 
 function renderOverlays() {
   if (!ovList) return;
+  const state = s => s.failed ? ['bad', 'Failed to load — codec may be unsupported']
+                   : s.ready ? ['ok', 'Ready — triggers instantly']
+                   : s.warming ? ['load', 'Preloading…']
+                   : ['', 'Not preloaded yet'];
   ovList.innerHTML = overlays.slots.length ? overlays.slots.map((s, i) => `
     <div class="ov-row${overlays.active === i ? ' playing' : ''}" data-id="${s.id}">
       <button class="ov-trig mini-btn" type="button" title="Trigger">${overlays.active === i ? '■' : '▶'}</button>
+      <span class="ov-state ${state(s)[0]}" title="${state(s)[1]}"></span>
       <span class="ov-name" title="${s.name}">${i < 8 ? `<b>${i + 1}</b>` : ''}${s.server ? '📁 ' : ''}${s.name}</span>
       <select class="ov-mode">
         <option value="loop"${s.mode === 'loop' ? ' selected' : ''}>Loop</option>
@@ -1080,6 +1393,17 @@ function renderOverlays() {
       </select>
       ${s.server ? '<span class="ov-del" style="visibility:hidden">✕</span>' : '<button class="ov-del" type="button" title="Delete">✕</button>'}
     </div>`).join('') : '<div class="kf-empty">No clips yet — add a file, or drop videos in the <b>vjloops/</b> folder.</div>';
+
+  if (overlays.slots.length) {
+    const ready = overlays.slots.filter(s => s.ready).length;
+    const bad = overlays.slots.filter(s => s.failed).length;
+    const d = document.createElement('div');
+    d.className = 'ov-warm';
+    d.textContent = `${ready}/${overlays.slots.length} clips preloaded`
+      + (bad ? ` · ${bad} failed` : '')
+      + (ready < overlays.slots.length - bad ? ' · warming…' : '');
+    ovList.appendChild(d);
+  }
 }
 
 // draw the active overlay into the scene buffer (gets bloom + is captured live)
@@ -1102,16 +1426,33 @@ function drawActiveOverlay(c) {
 }
 
 /* ---- scene package ---- */
+// restore the overlay clip bank + active trigger from a saved preset
+function restoreClips(cfg) {
+  if (!Array.isArray(cfg.clips)) return;
+  for (const c of cfg.clips) {
+    let s = overlays.slots.find(x => x.id === c.id || (x.name === c.name && !!x.server === !!c.server));
+    if (!s && c.server && c.url) { addServerClip({ name: c.name, url: c.url }); s = overlays.slots[overlays.slots.length - 1]; }
+    if (s && c.mode) s.mode = c.mode;
+  }
+  renderOverlays();
+  if (cfg.activeId) {
+    const idx = overlays.slots.findIndex(x => x.id === cfg.activeId);
+    if (idx >= 0) overlayStart(idx);
+  }
+}
+
 function collectScene() {
   return {
     type: 'sonar-scene', v: 1,
     mode,
     shuffle: shuffle.on,
     mix: { sceneIntensity, eqBass, eqMid, eqTreble, beatSens, transType: trans.type, transDur: trans.dur },
-    post: { blur: post.blur, beatStrobe: post.beatStrobe, fadeIn: post.fadeIn, fadeOut: post.fadeOut },
+    post: { blur: post.blur, beatStrobe: post.beatStrobe, fadeIn: post.fadeIn, fadeOut: post.fadeOut, liveFade: post.liveFade },
     bg: { type: bg.type, c1: bg.c1, c2: bg.c2, img: imgToDataURL(bg.img, 1920) },
     overlay: { ...overlay, img: imgToDataURL(overlay.img, 1024), fx: { ...overlay.fx } },
-    overlaysCfg: { blend: overlays.blend, opacity: overlays.opacity, fit: overlays.fit, react: overlays.react, auto: overlays.auto },
+    overlaysCfg: { blend: overlays.blend, opacity: overlays.opacity, fit: overlays.fit, react: overlays.react, auto: overlays.auto,
+      clips: overlays.slots.map(s => ({ id: s.id, name: s.name, mode: s.mode, server: !!s.server, url: s.server ? s.url : undefined })),
+      activeId: (overlays.active >= 0 && overlays.slots[overlays.active]) ? overlays.slots[overlays.active].id : null },
     automations,
     lyrics: { ...lyrics },
     headroom,
@@ -1140,6 +1481,7 @@ async function applyScene(o) {
     overlays.fit = o.overlaysCfg.fit ?? overlays.fit;
     overlays.react = o.overlaysCfg.react ?? overlays.react;
     overlays.auto = o.overlaysCfg.auto ?? overlays.auto;
+    restoreClips(o.overlaysCfg);
   }
   automations = o.automations || {};
   if (o.lyrics) Object.assign(lyrics, o.lyrics);
@@ -1171,6 +1513,7 @@ function syncAllControls() {
   setSeg(strobeSeg, 's', post.beatStrobe);
   fadeInRange.value = post.fadeIn; fadeInVal.textContent = (+post.fadeIn).toFixed(1) + 's';
   fadeOutRange.value = post.fadeOut; fadeOutVal.textContent = (+post.fadeOut).toFixed(1) + 's';
+  liveFadeRange.value = post.liveFade || 0; liveFadeVal.textContent = post.liveFade > 0 ? (+post.liveFade).toFixed(1) + 's' : 'Off';
   setSeg(bgType, 't', bg.type); bgC1.value = bg.c1; bgC2.value = bg.c2;
   setSeg(ovBlend, 'b', overlays.blend); setSeg(ovFit, 'f', overlays.fit);
   ovOpacity.value = Math.round(overlays.opacity * 100); ovOpacityVal.textContent = ovOpacity.value + '%';
@@ -2184,6 +2527,745 @@ function modeCassette(c) {
   c.fillStyle = vg; c.fillRect(0, 0, W, H);
 }
 
+/* =====================================================================
+   MODE 23 — FIREFLIES  (drifting glow-mote swarm; kicks scatter it)
+   ===================================================================== */
+function modeFireflies(c) {
+  fade(c, 0.18);
+
+  // seed / top-up the swarm (density scales with canvas size)
+  const want = Math.min(160, Math.round((W * H) / 16000));
+  while (fireflies.length < want) fireflies.push({
+    x: Math.random() * W, y: Math.random() * H,
+    vx: (Math.random() - 0.5) * 1.2, vy: (Math.random() - 0.5) * 1.2,
+    ph: Math.random() * TAU, hu: Math.random() * 60 - 30,
+  });
+  if (fireflies.length > want) fireflies.length = want;
+
+  c.globalCompositeOperation = 'lighter';
+  const drift = frame * 0.004;
+  for (const f of fireflies) {
+    // wander + gentle pull toward a slowly orbiting attractor (bass tightens it)
+    const ax = CX + Math.cos(drift + f.ph) * W * 0.22;
+    const ay = CY + Math.sin(drift * 1.3 + f.ph) * H * 0.22;
+    f.vx += (ax - f.x) * 0.0004 * (1 + A.bass * 2) + (Math.random() - 0.5) * 0.16;
+    f.vy += (ay - f.y) * 0.0004 * (1 + A.bass * 2) + (Math.random() - 0.5) * 0.16;
+    if (A.beatHit) {                        // the kick blows the swarm outward
+      const a = Math.atan2(f.y - CY, f.x - CX);
+      f.vx += Math.cos(a) * (1.5 + A.bass * 3);
+      f.vy += Math.sin(a) * (1.5 + A.bass * 3);
+    }
+    const sp = Math.hypot(f.vx, f.vy), max = 1.6 + A.mid * 3;
+    if (sp > max) { f.vx *= max / sp; f.vy *= max / sp; }
+    f.x += f.vx; f.y += f.vy;
+    if (f.x < -20) f.x = W + 20; else if (f.x > W + 20) f.x = -20;
+    if (f.y < -20) f.y = H + 20; else if (f.y > H + 20) f.y = -20;
+
+    // each firefly blinks on its own phase; treble brightens the whole field
+    const bl = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(frame * 0.06 + f.ph * 7));
+    const al = bl * (0.30 + A.treble * 0.8 + A.beat * 0.3);
+    const r = 1.6 + bl * 2.2 + A.bass * 2;
+    const h = (hue + 60 + f.hu) % 360;
+    const g = c.createRadialGradient(f.x, f.y, 0, f.x, f.y, r * 4);
+    g.addColorStop(0, `hsla(${h}, 100%, 75%, ${al})`);
+    g.addColorStop(0.3, `hsla(${h}, 100%, 60%, ${al * 0.5})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g;
+    c.beginPath(); c.arc(f.x, f.y, r * 4, 0, TAU); c.fill();
+  }
+  drawParticles(c);
+}
+
+/* =====================================================================
+   MODE 24 — JELLYFISH  (deep-sea jellies pulsing to the bass; bubbles)
+   ===================================================================== */
+function modeJellyfish(c) {
+  if (!paintBg(c)) {
+    c.globalCompositeOperation = 'source-over';
+    const g = c.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#03101c'); g.addColorStop(1, '#010409');
+    c.fillStyle = g; c.fillRect(0, 0, W, H);
+  }
+
+  // drifting light shafts from the surface
+  c.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 5; i++) {
+    const sx = ((i * 0.23 + frame * 0.00025) % 1) * W * 1.4 - W * 0.2;
+    const g = c.createLinearGradient(sx, 0, sx + W * 0.16, H);
+    g.addColorStop(0, `hsla(${(hue + 150) % 360}, 70%, 60%, ${0.05 + A.mid * 0.05})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g;
+    c.beginPath(); c.moveTo(sx, 0); c.lineTo(sx + W * 0.07, 0);
+    c.lineTo(sx + W * 0.28, H); c.lineTo(sx + W * 0.10, H); c.closePath(); c.fill();
+  }
+
+  if (!jellies.length) for (let i = 0; i < 4; i++) jellies.push({
+    x: (i + 0.5 + (Math.random() - 0.5) * 0.4) / 4, y: 0.25 + Math.random() * 0.45,
+    s: 0.55 + Math.random() * 0.6, ph: Math.random() * TAU, hu: i * 55,
+  });
+
+  for (const j of jellies) {
+    j.ph += 0.015 + A.bass * 0.03;
+    const px = j.x * W + Math.sin(frame * 0.004 + j.ph * 3) * W * 0.06;
+    const py = j.y * H + Math.sin(frame * 0.006 + j.ph * 5) * H * 0.05 - A.beat * H * 0.012;
+    const R = Math.min(W, H) * 0.09 * j.s * (1 + A.bass * 0.3);
+    const squash = 0.72 + 0.22 * Math.sin(j.ph * 2) + A.beat * 0.18;   // bell contraction
+    const h = (hue + 120 + j.hu) % 360;
+
+    // tentacles first (they hang behind the bell)
+    c.globalCompositeOperation = 'lighter';
+    const tn = 7;
+    for (let t = 0; t < tn; t++) {
+      const tx = px - R * 0.8 + (t / (tn - 1)) * R * 1.6;
+      c.strokeStyle = `hsla(${(h + 20) % 360}, 95%, 70%, ${0.22 + A.treble * 0.4})`;
+      c.lineWidth = 1.4;
+      c.beginPath(); c.moveTo(tx, py + 2);
+      const len = R * (1.8 + A.mid * 1.2), seg = 8;
+      for (let s = 1; s <= seg; s++) {
+        const tt = s / seg;
+        const wob = Math.sin(j.ph * 4 + t * 1.7 + tt * 5) * R * 0.22 * tt
+                  + (time[(t * 37 + s * 13) % time.length] / 128 - 1) * R * 0.18 * tt;
+        c.lineTo(tx + wob, py + len * tt);
+      }
+      c.stroke();
+    }
+
+    // glowing bell
+    c.shadowColor = `hsla(${h}, 100%, 65%, 0.8)`;
+    c.shadowBlur = R * 0.5;
+    const bell = c.createRadialGradient(px, py, 0, px, py, R);
+    bell.addColorStop(0, `hsla(${h}, 95%, 72%, ${0.30 + A.mid * 0.3})`);
+    bell.addColorStop(0.8, `hsla(${h}, 95%, 55%, 0.14)`);
+    bell.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = bell;
+    c.beginPath(); c.ellipse(px, py, R, R * squash, 0, Math.PI, TAU); c.fill();
+    c.strokeStyle = `hsla(${h}, 100%, 80%, 0.7)`;
+    c.lineWidth = 2.5;
+    c.beginPath(); c.ellipse(px, py, R, R * squash, 0, Math.PI, TAU); c.stroke();
+    c.shadowBlur = 0;
+  }
+
+  // rising bubbles — treble makes the water fizz
+  if (Math.random() < 0.1 + A.treble * 0.5)
+    jellyBubbles.push({ x: Math.random() * W, y: H + 8, r: 1 + Math.random() * 3, v: 0.6 + Math.random() * 1.4 });
+  for (let i = jellyBubbles.length - 1; i >= 0; i--) {
+    const b = jellyBubbles[i];
+    b.y -= b.v * (1 + A.level * 2); b.x += Math.sin(b.y * 0.02 + b.r * 9) * 0.5;
+    if (b.y < -10) { jellyBubbles.splice(i, 1); continue; }
+    c.strokeStyle = `hsla(${(hue + 160) % 360}, 80%, 80%, 0.35)`;
+    c.lineWidth = 1;
+    c.beginPath(); c.arc(b.x, b.y, b.r, 0, TAU); c.stroke();
+  }
+  if (jellyBubbles.length > 200) jellyBubbles.splice(0, jellyBubbles.length - 200);
+}
+
+/* =====================================================================
+   MODE 25 — HELIX  (rotating double helix; rungs light with the EQ)
+   ===================================================================== */
+function modeHelix(c) {
+  fade(c, 0.30);
+  helixRot += 0.012 + A.mid * 0.05 + A.beat * 0.05;
+
+  const rows = 44, amp = Math.min(W, H) * (0.22 + A.bass * 0.10);
+  const top = H * 0.06, bot = H * 0.94;
+  const twists = Math.PI * 3;
+
+  c.globalCompositeOperation = 'lighter';
+  c.lineCap = 'round';
+  // base-pair rungs (behind the strands)
+  for (let i = 0; i < rows; i++) {
+    const t = i / (rows - 1);
+    const y = top + (bot - top) * t;
+    const a = helixRot + t * twists;
+    const s = Math.sin(a), depth = (Math.cos(a) + 1) / 2;   // 0 back → 1 front
+    const x1 = CX + s * amp, x2 = CX - s * amp;
+    const f = freq[Math.floor(Math.pow(t, 1.4) * freq.length * 0.7)] / 255;
+    const h = (hue + t * 140) % 360;
+    c.strokeStyle = `hsla(${h}, 95%, ${45 + f * 30}%, ${0.10 + f * 0.55})`;
+    c.lineWidth = 1.5 + f * 5;
+    c.beginPath(); c.moveTo(x1, y); c.lineTo(x2, y); c.stroke();
+    for (const x of [x1, x2]) {
+      const r = (2 + f * 6) * (0.5 + depth * 0.8);
+      c.fillStyle = `hsla(${h}, 100%, ${60 + depth * 25}%, ${0.25 + depth * 0.6})`;
+      c.beginPath(); c.arc(x, y, r, 0, TAU); c.fill();
+    }
+  }
+  // the two backbone strands
+  c.shadowBlur = 12;
+  for (const off of [0, Math.PI]) {
+    const h = (hue + (off ? 40 : 0)) % 360;
+    c.shadowColor = `hsla(${h}, 100%, 60%, 0.8)`;
+    c.strokeStyle = `hsla(${h}, 100%, 70%, 0.8)`;
+    c.lineWidth = 3;
+    c.beginPath();
+    const N = 90;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N, y = top + (bot - top) * t;
+      const x = CX + Math.sin(helixRot + t * twists + off) * amp;
+      i ? c.lineTo(x, y) : c.moveTo(x, y);
+    }
+    c.stroke();
+  }
+  c.shadowBlur = 0;
+  drawParticles(c);
+}
+
+/* =====================================================================
+   MODE 26 — RADAR  (sonar sweep; beats paint contacts on the scope)
+   ===================================================================== */
+function modeRadar(c) {
+  fade(c, 0.10);   // phosphor persistence — the sweep leaves its own wake
+  radarRot += 0.022 + A.mid * 0.05 + A.beat * 0.03;
+  const R = Math.min(W, H) * 0.44 * (1 + A.bass * 0.06);
+  const h = (hue + 110) % 360;   // shifted toward scope-green/cyan
+
+  // grid: range rings + crosshair
+  c.globalCompositeOperation = 'lighter';
+  c.strokeStyle = `hsla(${h}, 80%, 55%, 0.20)`;
+  c.lineWidth = 1;
+  for (let k = 1; k <= 4; k++) { c.beginPath(); c.arc(CX, CY, R * k / 4, 0, TAU); c.stroke(); }
+  c.beginPath();
+  c.moveTo(CX - R, CY); c.lineTo(CX + R, CY);
+  c.moveTo(CX, CY - R); c.lineTo(CX, CY + R);
+  c.stroke();
+
+  // spectrum ring around the bezel — the signal meter
+  const bins = 96;
+  c.lineWidth = 2;
+  for (let i = 0; i < bins; i++) {
+    const f = freq[Math.floor(i / bins * freq.length * 0.7)] / 255;
+    const a = (i / bins) * TAU - Math.PI / 2;
+    const [x1, y1] = polar(CX, CY, R * 1.04, a);
+    const [x2, y2] = polar(CX, CY, R * (1.04 + f * 0.18), a);
+    c.strokeStyle = `hsla(${(h + f * 60) % 360}, 95%, 60%, ${0.2 + f * 0.6})`;
+    c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke();
+  }
+
+  // rotating sweep with a fading fan behind the leading edge
+  const trail = 1.1;
+  c.lineWidth = Math.max(2, R * 0.012);
+  for (let s = 0; s < 22; s++) {
+    const a = radarRot - s / 22 * trail;
+    c.strokeStyle = `hsla(${h}, 100%, ${70 - s * 1.5}%, ${(1 - s / 22) * (0.5 + A.level * 0.4)})`;
+    const [x, y] = polar(CX, CY, R, a);
+    c.beginPath(); c.moveTo(CX, CY); c.lineTo(x, y); c.stroke();
+  }
+
+  // contacts: beats drop blips; the sweep re-lights them as it passes
+  if (A.beatHit) {
+    for (let i = 0, n = 1 + (A.bass * 3 | 0); i < n; i++)
+      radarBlips.push({ a: Math.random() * TAU, r: 0.25 + Math.random() * 0.7, life: 1, big: A.bass > 0.5 });
+    if (radarBlips.length > 40) radarBlips.splice(0, radarBlips.length - 40);
+  }
+  for (let i = radarBlips.length - 1; i >= 0; i--) {
+    const b = radarBlips[i];
+    b.life -= 0.008;
+    if (b.life <= 0) { radarBlips.splice(i, 1); continue; }
+    const [x, y] = polar(CX, CY, b.r * R, b.a);
+    const da = ((radarRot - b.a) % TAU + TAU) % TAU;
+    const lit = Math.max(0, 1 - da * 2.2);
+    const al = Math.min(1, b.life * 0.5 + lit);
+    const r2 = (b.big ? 6 : 3.5) * (1 + lit);
+    c.fillStyle = `hsla(${h}, 100%, ${65 + lit * 25}%, ${al})`;
+    c.beginPath(); c.arc(x, y, r2, 0, TAU); c.fill();
+    if (lit > 0.55) {   // fresh ping ring right behind the sweep
+      c.strokeStyle = `hsla(${h}, 100%, 75%, ${(lit - 0.55) * 1.5})`;
+      c.lineWidth = 1.5;
+      c.beginPath(); c.arc(x, y, r2 * (3 - lit * 2), 0, TAU); c.stroke();
+    }
+  }
+
+  // glowing scope centre
+  const cg = c.createRadialGradient(CX, CY, 0, CX, CY, R * 0.12);
+  cg.addColorStop(0, `hsla(${h}, 100%, 80%, ${0.5 + A.beat * 0.5})`);
+  cg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = cg;
+  c.beginPath(); c.arc(CX, CY, R * 0.12, 0, TAU); c.fill();
+}
+
+/* =====================================================================
+   MODE 27 — SKYLINE  (night metropolis; towers ride the EQ, windows
+   flicker with their band, heavy kicks throw sheet lightning)
+   ===================================================================== */
+function modeSkyline(c) {
+  if (!paintBg(c)) {
+    c.globalCompositeOperation = 'source-over';
+    const g = c.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#04060d');
+    g.addColorStop(0.65, `hsl(${(hue + 250) % 360}, 45%, 9%)`);
+    g.addColorStop(1, `hsl(${(hue + 300) % 360}, 55%, 13%)`);
+    c.fillStyle = g; c.fillRect(0, 0, W, H);
+  }
+
+  // (re)build the street when the canvas size changes
+  if (!cityBlds.length || cityW !== W) {
+    cityW = W; cityBlds = [];
+    let x = -20;
+    while (x < W + 20) {
+      const bw = W * (0.025 + Math.random() * 0.045);
+      cityBlds.push({ x, w: bw, h: 0.18 + Math.random() * 0.55, seed: Math.random() * 1000 });
+      x += bw + W * 0.004;
+    }
+  }
+
+  // stars + moon
+  c.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 60; i++) {
+    const sx = (i * 97.3) % W, sy = (i * 57.7) % (H * 0.5);
+    const tw = 0.5 + 0.5 * Math.sin(frame * 0.05 + i * 3);
+    c.fillStyle = `rgba(200,220,255,${0.10 + tw * 0.25 * (0.4 + A.treble)})`;
+    c.fillRect(sx, sy, 1.5, 1.5);
+  }
+  const mx = W * 0.82, my = H * 0.16, mr = Math.min(W, H) * 0.045;
+  const mg = c.createRadialGradient(mx, my, 0, mx, my, mr * 3);
+  mg.addColorStop(0, 'rgba(235,240,255,0.9)');
+  mg.addColorStop(0.25, 'rgba(200,215,255,0.25)');
+  mg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = mg; c.beginPath(); c.arc(mx, my, mr * 3, 0, TAU); c.fill();
+
+  // sheet lightning on heavy kicks
+  if (A.beatHit && A.bass > 0.45) cityBolt = 1;
+  if (cityBolt > 0.02) {
+    c.fillStyle = `hsla(${(hue + 220) % 360}, 80%, 80%, ${cityBolt * 0.18})`;
+    c.fillRect(0, 0, W, H);
+    cityBolt *= 0.82;
+  }
+
+  // towers + windows
+  const base = H * 0.98, n = cityBlds.length;
+  for (let i = 0; i < n; i++) {
+    const b = cityBlds[i];
+    const f = freq[Math.floor(Math.pow(i / n, 1.3) * freq.length * 0.6)] / 255;
+    const bh = H * b.h * (0.75 + f * 0.5 + A.bass * 0.1);   // each tower rides its band
+    const y = base - bh;
+    c.globalCompositeOperation = 'source-over';
+    c.fillStyle = '#04050a';
+    c.fillRect(b.x, y, b.w, bh);
+
+    c.globalCompositeOperation = 'lighter';
+    const cw = b.w / 4, ch = H * 0.022;
+    const cols = 3, rows = Math.min(24, Math.floor(bh / ch) - 1);
+    const wh = (hue + 40 + i * 3) % 360;
+    for (let r = 0; r < rows; r++) for (let q = 0; q < cols; q++) {
+      const rnd = Math.sin(b.seed + r * 12.9898 + q * 78.233) * 43758.5453;
+      if (rnd - Math.floor(rnd) > 0.12 + f * 0.55) continue;   // window off
+      c.fillStyle = `hsla(${wh}, 85%, ${55 + f * 25}%, ${0.30 + f * 0.5})`;
+      c.fillRect(b.x + cw * (q + 0.55), y + ch * (r + 0.6), cw * 0.5, ch * 0.45);
+    }
+    // rooftop beacon on the tallest towers
+    if (b.h > 0.55) {
+      const bk = 0.4 + 0.6 * Math.sin(frame * 0.1 + b.seed);
+      c.fillStyle = `rgba(255,60,70,${Math.max(0, bk) * (0.4 + A.treble * 0.5)})`;
+      c.beginPath(); c.arc(b.x + b.w / 2, y - 3, 2.2, 0, TAU); c.fill();
+    }
+  }
+
+  // street haze glowing with the bass
+  const gz = c.createLinearGradient(0, base - H * 0.05, 0, H);
+  gz.addColorStop(0, 'rgba(0,0,0,0)');
+  gz.addColorStop(1, `hsla(${(hue + 20) % 360}, 90%, 55%, ${0.10 + A.bass * 0.22})`);
+  c.fillStyle = gz;
+  c.fillRect(0, base - H * 0.05, W, H - base + H * 0.05);
+  drawParticles(c);
+}
+
+/* =====================================================================
+   MODE 28 — FIREWORKS  (beats launch rockets; bursts, rings, crackle)
+   ===================================================================== */
+function modeFireworks(c) {
+  fade(c, 0.13);
+
+  const launch = n => {
+    for (let i = 0; i < n; i++) fwRockets.push({
+      x: W * (0.15 + Math.random() * 0.7), y: H + 6,
+      vx: (Math.random() - 0.5) * 2.2,
+      vy: -H * (0.011 + Math.random() * 0.006) * (1 + A.bass * 0.35),
+      hu: (hue + Math.random() * 90) % 360,
+      fuse: H * (0.32 + Math.random() * 0.33),
+    });
+  };
+  if (A.beatHit) launch(1 + Math.round(A.bass * 3));
+  else if (isPlaying() && A.level > 0.12 && Math.random() < 0.012) launch(1);   // idle lulls still get the odd shell
+
+  c.globalCompositeOperation = 'lighter';
+  // rockets climb, sparkle, then burst at the top of their fuse
+  for (let i = fwRockets.length - 1; i >= 0; i--) {
+    const r = fwRockets[i];
+    r.x += r.vx; r.y += r.vy; r.vy += H * 0.00012;
+    fwSparks.push({ x: r.x, y: r.y, vx: (Math.random() - 0.5) * 0.6, vy: Math.random() * 0.8, life: 0.35, hu: r.hu, r: 1.2, g: 0 });
+    c.fillStyle = `hsla(${r.hu}, 100%, 80%, 0.9)`;
+    c.beginPath(); c.arc(r.x, r.y, 2.2, 0, TAU); c.fill();
+    if (r.y < H - r.fuse || r.vy > -1) {
+      fwRockets.splice(i, 1);
+      const n = 50 + Math.round(A.level * 70) + (Math.random() * 30 | 0);
+      const ring = Math.random() < 0.3;          // some shells burst as perfect rings
+      for (let k = 0; k < n; k++) {
+        const a = ring ? k / n * TAU : Math.random() * TAU;
+        const sp = ring ? 5.5 : 1.5 + Math.random() * 6.5;
+        fwSparks.push({
+          x: r.x, y: r.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+          life: 1, hu: (r.hu + Math.random() * 40 - 20 + 360) % 360,
+          r: 1.4 + Math.random() * 1.8, g: 1,
+        });
+      }
+    }
+  }
+  // sparks: drag + gravity, crackling twinkle as they die
+  for (let i = fwSparks.length - 1; i >= 0; i--) {
+    const s = fwSparks[i];
+    s.x += s.vx; s.y += s.vy;
+    s.vx *= 0.975; s.vy = s.vy * 0.975 + (s.g ? H * 0.00016 : 0);
+    s.life -= 0.011;
+    if (s.life <= 0) { fwSparks.splice(i, 1); continue; }
+    const tw = s.life < 0.35 ? (Math.random() < 0.5 ? 0.2 : 1) : 1;
+    c.fillStyle = `hsla(${s.hu}, 100%, ${60 + s.life * 30}%, ${s.life * tw})`;
+    c.beginPath(); c.arc(s.x, s.y, s.r * (0.5 + s.life * 0.7), 0, TAU); c.fill();
+  }
+  if (fwSparks.length > 1600) fwSparks.splice(0, fwSparks.length - 1600);
+
+  // silhouetted horizon + crowd-glow that breathes with the level
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#020308';
+  c.fillRect(0, H * 0.965, W, H * 0.035);
+  c.globalCompositeOperation = 'lighter';
+  const hg = c.createLinearGradient(0, H, 0, H * 0.86);
+  hg.addColorStop(0, `hsla(${hue}, 90%, 60%, ${0.08 + A.level * 0.16})`);
+  hg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = hg;
+  c.fillRect(0, H * 0.86, W, H * 0.14);
+}
+
+/* =====================================================================
+   MODE 29 — INFERNO  (roaring flame wall driven by the bass; embers)
+   ===================================================================== */
+function modeInferno(c) {
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(3,1,0,0.32)'; c.fillRect(0, 0, W, H);
+
+  // radiant heat rising from the floor
+  const hg = c.createLinearGradient(0, H, 0, H * 0.35);
+  hg.addColorStop(0, `rgba(255,60,10,${0.20 + A.bass * 0.30})`);
+  hg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = hg; c.fillRect(0, 0, W, H);
+
+  // three flame layers, hottest in front; peaks ride the low spectrum
+  c.globalCompositeOperation = 'lighter';
+  const layers = [
+    { col: a => `rgba(255,40,0,${a})`,    amp: 0.58, sp: 0.9 },
+    { col: a => `rgba(255,140,0,${a})`,   amp: 0.44, sp: 1.3 },
+    { col: a => `rgba(255,235,120,${a})`, amp: 0.30, sp: 1.8 },
+  ];
+  const segs = 64;
+  for (let L = 0; L < layers.length; L++) {
+    const lay = layers[L];
+    c.fillStyle = lay.col(0.16 + A.bass * 0.20);
+    c.beginPath(); c.moveTo(0, H);
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      const f = freq[Math.floor(t * freq.length * 0.5)] / 255;
+      const n = Math.sin(t * 21 + frame * 0.05 * lay.sp + L * 9)
+              + Math.sin(t * 47 - frame * 0.083 * lay.sp) * 0.5;
+      c.lineTo(t * W, H - (f * 1.1 + Math.max(0, n) * 0.28 + A.bass * 0.4) * H * lay.amp);
+    }
+    c.lineTo(W, H); c.closePath(); c.fill();
+  }
+
+  // embers spiralling up on the heat
+  if (Math.random() < 0.3 + A.level * 0.6) emberParts.push({
+    x: Math.random() * W, y: H + 4, vy: 1 + Math.random() * 2.5,
+    ph: Math.random() * TAU, life: 1, r: 1 + Math.random() * 2,
+  });
+  for (let i = emberParts.length - 1; i >= 0; i--) {
+    const p = emberParts[i];
+    p.y -= p.vy * (1 + A.bass * 1.6);
+    p.x += Math.sin(p.y * 0.02 + p.ph) * 1.4;
+    p.life -= 0.006;
+    if (p.life <= 0 || p.y < -10) { emberParts.splice(i, 1); continue; }
+    c.fillStyle = `hsla(${20 + p.life * 35}, 100%, ${55 + p.life * 30}%, ${p.life * 0.9})`;
+    c.beginPath(); c.arc(p.x, p.y, p.r * (0.4 + p.life * 0.8), 0, TAU); c.fill();
+  }
+  if (emberParts.length > 500) emberParts.splice(0, emberParts.length - 500);
+
+  // white-hot flare on the kick
+  if (A.beat > 0.02) {
+    const fl = c.createRadialGradient(CX, H * 0.9, 0, CX, H * 0.9, Math.max(W, H) * 0.55);
+    fl.addColorStop(0, `rgba(255,240,200,${A.beat * 0.30})`);
+    fl.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = fl; c.fillRect(0, 0, W, H);
+  }
+}
+
+/* =====================================================================
+   MODE 30 — ORBITS  (planets with comet trails around a pulsing sun)
+   ===================================================================== */
+function modeOrbits(c) {
+  fade(c, 0.16);   // trails
+  const S = Math.min(W, H);
+
+  if (!orbitBodies.length) for (let i = 0; i < 6; i++) orbitBodies.push({
+    a: Math.random() * TAU,
+    r: 0.16 + i * 0.115,                        // orbit radius, fraction of S
+    sp: 0.02 / Math.pow(0.16 + i * 0.115, 1.1) * 0.16,  // Kepler-ish: outer = slower
+    s: 0.010 + Math.random() * 0.012, hu: i * 45,
+    moon: i > 1 && Math.random() < 0.5, ma: Math.random() * TAU,
+  });
+
+  // asteroid belt shimmering with the treble
+  c.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 90; i++) {
+    const a = i * 2.399 + frame * 0.0012;
+    const rr = S * 0.46 + Math.sin(i * 7.3) * S * 0.02;
+    const [x, y] = polar(CX, CY, rr, a);
+    const tw = 0.5 + 0.5 * Math.sin(frame * 0.08 + i * 5);
+    c.fillStyle = `hsla(${(hue + 30) % 360}, 60%, 70%, ${(0.05 + tw * 0.18) * (0.4 + A.treble * 1.4)})`;
+    c.fillRect(x, y, 1.6, 1.6);
+  }
+
+  for (let i = 0; i < orbitBodies.length; i++) {
+    const b = orbitBodies[i];
+    const f = freq[Math.floor((i + 1) / 8 * freq.length * 0.3)] / 255;
+    const OR = b.r * S;
+    // orbit ring lights up with its band
+    c.strokeStyle = `hsla(${(hue + b.hu) % 360}, 80%, 60%, ${0.04 + f * 0.22})`;
+    c.lineWidth = 1;
+    c.beginPath(); c.arc(CX, CY, OR, 0, TAU); c.stroke();
+
+    b.a += b.sp * (1 + A.mid * 2.5 + A.beat * 1.2);
+    const [x, y] = polar(CX, CY, OR, b.a);
+    const pr = S * (b.s + f * 0.012);
+    const h = (hue + b.hu) % 360;
+    const g = c.createRadialGradient(x, y, 0, x, y, pr * 2.6);
+    g.addColorStop(0, `hsla(${h}, 95%, 78%, ${0.85 + f * 0.15})`);
+    g.addColorStop(0.4, `hsla(${h}, 95%, 55%, 0.5)`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g;
+    c.beginPath(); c.arc(x, y, pr * 2.6, 0, TAU); c.fill();
+    if (b.moon) {
+      b.ma += 0.09 + A.treble * 0.15;
+      const [mx2, my2] = polar(x, y, pr * 3.4, b.ma);
+      c.fillStyle = `hsla(${(h + 60) % 360}, 90%, 80%, 0.8)`;
+      c.beginPath(); c.arc(mx2, my2, pr * 0.35, 0, TAU); c.fill();
+    }
+  }
+
+  // the sun — swells on the bass, flares on the beat
+  const sr = S * (0.055 + A.bass * 0.05 + A.beat * 0.03);
+  const sg = c.createRadialGradient(CX, CY, 0, CX, CY, sr * 3);
+  sg.addColorStop(0, `hsla(${(hue + 40) % 360}, 100%, 88%, 1)`);
+  sg.addColorStop(0.3, `hsla(${(hue + 25) % 360}, 100%, 60%, ${0.5 + A.bass * 0.4})`);
+  sg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = sg;
+  c.beginPath(); c.arc(CX, CY, sr * 3, 0, TAU); c.fill();
+  drawParticles(c);
+}
+
+/* =====================================================================
+   MODE 31 — BUNKER  (hard-techno / schranz: a dying floodlight behind a
+   grinding industrial fan, chains swinging from the ceiling, smoke, hard
+   red strobes. The room shakes on the kick. Grime overlays on top: heavy
+   grain, film scratches, scanlines, glitch tears, projector blackouts and
+   a choking vignette. Monochrome + blood red — ignores the global hue on
+   purpose, like SIREN.)
+   ===================================================================== */
+function modeBunker(c) {
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(3,1,1,0.55)'; c.fillRect(0, 0, W, H);
+  const S = Math.min(W, H);
+
+  // the whole room jolts on the kick
+  const shk = A.beat * S * 0.012;
+  c.save();
+  c.translate((Math.random() - 0.5) * shk * 2, (Math.random() - 0.5) * shk * 2);
+
+  // the floodlight is broken: it buzzes, browns out, and sometimes dies
+  // outright for a bunch of frames before stuttering back to life
+  if (bunkerFail <= 0 && Math.random() < 0.007) bunkerFail = 8 + Math.random() * 25;
+  let flick = (0.16 + A.bass * 0.45 + A.beat * 0.75) * (0.72 + Math.random() * 0.28);
+  if (bunkerFail > 0) { bunkerFail--; flick *= Math.random() < 0.15 ? 0.9 : 0.04; }
+
+  // dirty light: sickly warm core buried in blood red — never a clean white
+  c.globalCompositeOperation = 'lighter';
+  const bl = c.createRadialGradient(CX, CY, 0, CX, CY, S * 0.55);
+  bl.addColorStop(0, `rgba(255,225,200,${Math.min(1, flick)})`);
+  bl.addColorStop(0.26, `rgba(220,15,15,${0.3 + A.bass * 0.35})`);
+  bl.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bl; c.beginPath(); c.arc(CX, CY, S * 0.55, 0, TAU); c.fill();
+
+  // smoke plumes crawling up through the light
+  if (bunkerSmoke.length < 22 && Math.random() < 0.25) bunkerSmoke.push({
+    x: Math.random() * W, y: H * (0.45 + Math.random() * 0.65),
+    r: S * (0.09 + Math.random() * 0.15),
+    vx: (Math.random() - 0.5) * 0.6, vy: -(0.25 + Math.random() * 0.5),
+    ph: Math.random() * TAU, life: 1,
+  });
+  for (let i = bunkerSmoke.length - 1; i >= 0; i--) {
+    const p = bunkerSmoke[i];
+    p.x += p.vx + Math.sin(frame * 0.01 + p.ph) * 0.4;
+    p.y += p.vy * (1 + A.bass * 0.8);
+    p.life -= 0.0035;
+    if (p.life <= 0 || p.y < -p.r) { bunkerSmoke.splice(i, 1); continue; }
+    // smoke is only visible where the light hits it, tinted by the red glow
+    const lit = Math.max(0, 1 - Math.hypot(p.x - CX, p.y - CY) / (S * 0.7));
+    const sg = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+    sg.addColorStop(0, `rgba(210,170,170,${p.life * lit * (0.04 + flick * 0.11)})`);
+    sg.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = sg; c.beginPath(); c.arc(p.x, p.y, p.r, 0, TAU); c.fill();
+  }
+
+  // the fan — a grinding black hulk chopping the light. It doesn't spin
+  // clean: it stutters, catches, and jerks backwards like the bearing is shot
+  const spin = 0.05 + A.bass * 0.4 + A.beat * 0.25;
+  bunkerRot += Math.random() < 0.04 ? -spin * 2.5 : spin * (Math.random() < 0.06 ? 0.1 : 1);
+  const FR = S * 0.33;
+  c.globalCompositeOperation = 'source-over';
+  c.save(); c.translate(CX, CY); c.rotate(bunkerRot);
+  c.fillStyle = '#000';
+  for (let b = 0; b < 5; b++) {
+    c.rotate(TAU / 5);
+    // jagged, chipped blade — broken teeth along the trailing edge
+    c.beginPath();
+    c.moveTo(0, 0);
+    c.quadraticCurveTo(FR * 0.55, -FR * 0.3, FR, -FR * 0.12);
+    c.lineTo(FR * 0.97, FR * 0.06);
+    c.lineTo(FR * 0.84, FR * 0.10);
+    c.lineTo(FR * 0.90, FR * 0.22);
+    c.lineTo(FR * 0.68, FR * 0.20);
+    c.lineTo(FR * 0.60, FR * 0.30);
+    c.quadraticCurveTo(FR * 0.4, FR * 0.16, 0, 0);
+    c.closePath(); c.fill();
+  }
+  c.beginPath(); c.arc(0, 0, FR * 0.17, 0, TAU); c.fill();
+  c.restore();
+  // housing ring, rim-lit red so the machine stays readable between hits
+  c.lineWidth = S * 0.028;
+  c.strokeStyle = '#000';
+  c.beginPath(); c.arc(CX, CY, FR * 1.08, 0, TAU); c.stroke();
+  c.strokeStyle = `rgba(255,30,30,${0.10 + A.bass * 0.25 + A.beat * 0.3})`;
+  c.lineWidth = 2;
+  c.beginPath(); c.arc(CX, CY, FR * 1.08 + S * 0.016, 0, TAU); c.stroke();
+
+  // chains hanging off the ceiling, swinging with the low end — black
+  // silhouettes in front of everything
+  if (!bunkerChains.length || bunkerChains.cw !== W) {
+    bunkerChains = Object.assign([], { cw: W });
+    for (let i = 0; i < 7; i++) bunkerChains.push({
+      x: (0.06 + Math.random() * 0.88) * W,
+      len: H * (0.2 + Math.random() * 0.45),
+      ph: Math.random() * TAU, sp: 0.014 + Math.random() * 0.012,
+      w: S * (0.008 + Math.random() * 0.007),
+    });
+  }
+  c.strokeStyle = '#000'; c.lineCap = 'round';
+  for (const ch of bunkerChains) {
+    const sw = Math.sin(frame * ch.sp + ch.ph) * (0.06 + A.bass * 0.16);
+    const links = Math.round(ch.len / (ch.w * 2.4));
+    c.lineWidth = ch.w;
+    c.beginPath(); c.moveTo(ch.x, -4);
+    let lx = ch.x, ly = -4;
+    for (let k = 1; k <= links; k++) {
+      // each link hangs a little further into the swing — a lazy pendulum curve
+      lx = ch.x + Math.sin(sw) * (k / links) * ch.len * 0.9 * (k / links);
+      ly = -4 + (k / links) * ch.len;
+      c.lineTo(lx, ly);
+    }
+    c.stroke();
+    // faint red glint crawling down the chain when the light hits
+    c.strokeStyle = `rgba(255,40,40,${flick * 0.25})`;
+    c.lineWidth = 1;
+    c.beginPath(); c.moveTo(ch.x + 1, 0); c.lineTo(lx + 1, ly); c.stroke();
+    c.strokeStyle = '#000';
+  }
+
+  // strobe beams sweeping from the top corners — one harsh white, one blood
+  // red, slicing the smoke when the beat lands
+  c.globalCompositeOperation = 'lighter';
+  const R = Math.hypot(W, H) * 1.1;
+  for (let s = 0; s < 2; s++) {
+    const ox = s ? W : 0;
+    const a = Math.PI / 2 + (s ? -0.3 : 0.3) + Math.sin(frame * 0.014 + s * 2.4) * 0.5;
+    const spread = 0.03 + A.mid * 0.03;
+    const al = Math.min(0.75, 0.02 + A.beat * 0.45 + A.treble * 0.08);
+    const g = c.createRadialGradient(ox, -20, 0, ox, -20, R);
+    g.addColorStop(0, s ? `rgba(255,30,30,${al})` : `rgba(255,255,255,${al})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g;
+    c.beginPath(); c.moveTo(ox, -20);
+    c.arc(ox, -20, R, a - spread, a + spread); c.closePath(); c.fill();
+  }
+
+  // segmented red LED meters along the floor — half the segments are dead
+  // or dying, like the rack has been kicked one time too many
+  const cols = 48, bw2 = W / cols, seg = Math.max(4, S * 0.012);
+  for (let i = 0; i < cols; i++) {
+    const f = freq[Math.floor(Math.pow(i / cols, 1.35) * freq.length * 0.6)] / 255;
+    const segs = Math.floor(f * (H * 0.22) / seg);
+    for (let k = 0; k < segs; k++) {
+      if ((i * 7 + k * 13) % 9 === 0) continue;                 // dead segments
+      const dying = (i * 5 + k * 3) % 11 === 0 && Math.random() < 0.5;
+      const top = k === segs - 1;
+      c.fillStyle = top ? `rgba(255,120,120,${0.5 + f * 0.5})`
+                        : `rgba(255,20,20,${(0.1 + f * 0.28) * (dying ? 0.3 : 1)})`;
+      c.fillRect(i * bw2 + bw2 * 0.14, H - (k + 1) * seg + 1, bw2 * 0.72, seg - 2);
+    }
+  }
+
+  c.restore();   // end of room shake — overlays below stay locked to the frame
+
+  /* ---- grime overlays ---- */
+  // glitch tear: shove horizontal bands sideways on hard kicks
+  if (A.beat > 0.45 && Math.random() < 0.7) {
+    c.globalCompositeOperation = 'source-over';
+    const n = 4 + (Math.random() * 8 | 0);
+    for (let s = 0; s < n; s++) {
+      const y = Math.random() * H, hh = 4 + Math.random() * H * 0.07;
+      const dx = (Math.random() - 0.5) * W * 0.3 * A.beat;
+      c.drawImage(c.canvas, 0, y, W, hh, dx, y, W, hh);
+    }
+  }
+  // smeared double-exposure on the hit — the frame can't keep up
+  if (A.beat > 0.55) {
+    c.globalCompositeOperation = 'source-over';
+    c.globalAlpha = 0.22 * A.beat;
+    c.drawImage(c.canvas, 0, 0, c.canvas.width, c.canvas.height,
+                (Math.random() - 0.5) * S * 0.02, (Math.random() - 0.5) * S * 0.012, W, H);
+    c.globalAlpha = 1;
+  }
+  // strobe pop right on the hit — usually blood red, sometimes blinding white
+  if (A.beat > 0.8) {
+    c.globalCompositeOperation = 'lighter';
+    c.fillStyle = Math.random() < 0.25
+      ? `rgba(255,255,255,${(A.beat - 0.8) * 1.1})`
+      : `rgba(200,0,0,${(A.beat - 0.8) * 1.4})`;
+    c.fillRect(0, 0, W, H);
+  }
+  c.globalCompositeOperation = 'source-over';
+  // projector dropout: the odd frame just dies
+  if (Math.random() < 0.012) { c.fillStyle = 'rgba(0,0,0,0.85)'; c.fillRect(0, 0, W, H); }
+  // heavy grain — white dust and black dirt
+  for (let i = 0; i < 110; i++) {
+    c.fillStyle = `rgba(255,255,255,${Math.random() * 0.08})`;
+    c.fillRect(Math.random() * W, Math.random() * H, 1.5, 1.5);
+  }
+  for (let i = 0; i < 60; i++) {
+    c.fillStyle = `rgba(0,0,0,${Math.random() * 0.3})`;
+    c.fillRect(Math.random() * W, Math.random() * H, 2, 2);
+  }
+  // film scratches — flickering vertical hairlines
+  for (let i = 0; i < 3; i++) if (Math.random() < 0.4) {
+    const x = Math.random() * W;
+    c.fillStyle = `rgba(255,255,255,${0.02 + Math.random() * 0.05})`;
+    c.fillRect(x, 0, 1, H);
+  }
+  // rolling scanlines
+  c.fillStyle = 'rgba(0,0,0,0.18)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  // choking vignette, dragged slightly off-centre, pumping open on the kick
+  const vg = c.createRadialGradient(CX, CY + H * 0.06, S * (0.28 + A.beat * 0.12), CX, CY + H * 0.06, S * 0.88);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, `rgba(0,0,0,${0.9 - A.beat * 0.18})`);
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
 function roundRect(c, x, y, w, h, r) {
   r = Math.min(r, w / 2, Math.abs(h) / 2);
   c.beginPath();
@@ -2196,17 +3278,2290 @@ function roundRect(c, x, y, w, h, r) {
 }
 
 /* =====================================================================
+   MODE 32 — PRESS  (hydraulic stamping press — the kick IS the machine)
+   A monstrous black ram hangs over an anvil. Every kick releases it:
+   it free-falls, hits steel, and the impact throws a shower of white-hot
+   sparks that bounce and die red on the floor. Hazard stripes, rotating
+   beacons and vented steam keep the factory alive between hits.
+   ===================================================================== */
+function modePress(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#030102'; c.fillRect(0, 0, W, H);
+
+  // geometry
+  const anvilY = H * 0.78;                       // top of the anvil
+  const ramW = W * 0.36, ramX = CX - ramW / 2;
+  const restY = H * 0.16;                        // ram head bottom, retracted
+  const headH = S * 0.11;
+
+  // ---- ram state machine: kick → free-fall → impact → slow hydraulic retract
+  if (A.beatHit && !pressDrop && pressRam < 0.65) pressDrop = true;   // re-arms fast enough for 150+ BPM kicks
+  if (pressDrop) {
+    pressRam = Math.min(1, pressRam + 0.30 + pressRam * 0.25);   // accelerating fall
+    if (pressRam >= 1) {                                          // IMPACT
+      pressDrop = false;
+      pressImpact = 1;
+      const n = 60 + Math.round(A.bass * 90);
+      for (let i = 0; i < n; i++) {
+        const a = -Math.PI * (0.08 + Math.random() * 0.84);       // spray upward+sideways
+        const sp = (2 + Math.random() * 9) * (S / 500) * (0.7 + A.bass);
+        pressSparks.push({
+          x: CX + (Math.random() - 0.5) * ramW * 0.9, y: anvilY - 2,
+          vx: Math.cos(a) * sp * (Math.random() < 0.5 ? 1 : -1) * 1.6,
+          vy: Math.sin(a) * sp * 1.4,
+          life: 0.55 + Math.random() * 0.45, r: 1 + Math.random() * 2,
+        });
+      }
+    }
+  } else pressRam = Math.max(0, pressRam - 0.028 - A.level * 0.012);  // hiss back up
+  pressImpact *= 0.86;
+  const ramY = restY + (anvilY - headH - restY) * (pressRam * pressRam);   // eased drop
+
+  // impact shake — everything in the room jolts
+  const shk = pressImpact * S * 0.02;
+  c.save();
+  c.translate((Math.random() - 0.5) * shk * 2, (Math.random() - 0.5) * shk * 2);
+
+  // ---- red haze rising off the floor
+  const hz = c.createLinearGradient(0, anvilY - S * 0.4, 0, H);
+  hz.addColorStop(0, 'rgba(0,0,0,0)');
+  hz.addColorStop(1, `rgba(120,8,8,${0.16 + A.bass * 0.25 + pressImpact * 0.4})`);
+  c.fillStyle = hz; c.fillRect(0, 0, W, H);
+
+  // ---- rotating warning beacons in the top corners
+  pressBeacon += 0.05 + A.mid * 0.06;
+  c.globalCompositeOperation = 'lighter';
+  const BR = Math.hypot(W, H);
+  for (let b = 0; b < 2; b++) {
+    const ox = b ? W - S * 0.04 : S * 0.04, dir = b ? -1 : 1;
+    const a = Math.PI / 2 + Math.sin(pressBeacon + b * Math.PI) * 0.9 * dir;
+    const g = c.createRadialGradient(ox, 0, 0, ox, 0, BR);
+    g.addColorStop(0, `rgba(255,30,20,${0.14 + A.bass * 0.2 + pressImpact * 0.3})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g;
+    c.beginPath(); c.moveTo(ox, 0); c.arc(ox, 0, BR, a - 0.05, a + 0.05); c.closePath(); c.fill();
+    c.fillStyle = `rgba(255,60,40,${0.5 + Math.sin(pressBeacon * 2 + b) * 0.4})`;
+    c.beginPath(); c.arc(ox, S * 0.02, S * 0.012, 0, TAU); c.fill();
+  }
+
+  // ---- steam vents while retracting
+  if (!pressDrop && pressRam > 0.05 && Math.random() < 0.5 && pressSteam.length < 26) pressSteam.push({
+    x: ramX + (Math.random() < 0.5 ? 0 : ramW), y: ramY - headH * 0.4,
+    vx: (Math.random() - 0.5) * 2.2, vy: -(0.4 + Math.random()),
+    r: S * (0.02 + Math.random() * 0.04), life: 1,
+  });
+  c.globalCompositeOperation = 'source-over';
+  for (let i = pressSteam.length - 1; i >= 0; i--) {
+    const p = pressSteam[i];
+    p.x += p.vx; p.y += p.vy; p.r *= 1.02; p.life -= 0.022;
+    if (p.life <= 0) { pressSteam.splice(i, 1); continue; }
+    const sg = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+    sg.addColorStop(0, `rgba(200,160,160,${p.life * 0.10})`);
+    sg.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = sg; c.beginPath(); c.arc(p.x, p.y, p.r, 0, TAU); c.fill();
+  }
+
+  // ---- side frame pillars, red rim-lit
+  c.fillStyle = '#000';
+  c.fillRect(ramX - S * 0.07, 0, S * 0.06, anvilY);
+  c.fillRect(ramX + ramW + S * 0.01, 0, S * 0.06, anvilY);
+  c.fillStyle = `rgba(255,25,25,${0.12 + A.bass * 0.2})`;
+  c.fillRect(ramX - S * 0.012, 0, 2, anvilY);
+  c.fillRect(ramX + ramW + S * 0.01, 0, 2, anvilY);
+
+  // ---- the ram: hydraulic rod + massive head with hazard stripes
+  c.fillStyle = '#0a0a0c';
+  c.fillRect(CX - S * 0.03, 0, S * 0.06, ramY - headH);            // rod
+  c.fillStyle = `rgba(255,40,30,${0.25 + pressImpact * 0.5})`;      // hot rod seam
+  c.fillRect(CX - 1.5, 0, 3, ramY - headH);
+  c.fillStyle = '#050507';
+  c.fillRect(ramX, ramY - headH, ramW, headH);                      // head block
+  // hazard stripe band (red / black diagonals)
+  c.save();
+  c.beginPath(); c.rect(ramX, ramY - headH * 0.42, ramW, headH * 0.42); c.clip();
+  for (let x = -headH; x < ramW + headH; x += headH * 0.5) {
+    c.fillStyle = ((x / (headH * 0.5)) | 0) % 2 ? '#a80f0f' : '#111';
+    c.beginPath();
+    c.moveTo(ramX + x, ramY); c.lineTo(ramX + x + headH * 0.25, ramY);
+    c.lineTo(ramX + x + headH * 0.25 - headH * 0.42, ramY - headH * 0.42);
+    c.lineTo(ramX + x - headH * 0.42, ramY - headH * 0.42);
+    c.closePath(); c.fill();
+  }
+  c.restore();
+  // grinding face edge, glows hotter with each hit
+  c.fillStyle = `rgba(255,${60 + pressImpact * 180},40,${0.4 + pressImpact * 0.6})`;
+  c.fillRect(ramX, ramY - 3, ramW, 3);
+
+  // ---- anvil + floor
+  c.fillStyle = '#050505';
+  c.fillRect(0, anvilY, W, H - anvilY);
+  c.fillStyle = '#0c0b0d';
+  c.fillRect(ramX - S * 0.03, anvilY, ramW + S * 0.06, S * 0.02);
+  c.fillStyle = `rgba(255,30,25,${0.2 + A.bass * 0.3 + pressImpact * 0.6})`;
+  c.fillRect(ramX - S * 0.03, anvilY, ramW + S * 0.06, 2);
+
+  // ---- impact flash: blinding sheet of light squeezed out of the die
+  if (pressImpact > 0.05) {
+    c.globalCompositeOperation = 'lighter';
+    const fg = c.createRadialGradient(CX, anvilY, 0, CX, anvilY, S * 0.7);
+    fg.addColorStop(0, `rgba(255,240,220,${pressImpact})`);
+    fg.addColorStop(0.25, `rgba(255,60,30,${pressImpact * 0.6})`);
+    fg.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = fg; c.beginPath(); c.arc(CX, anvilY, S * 0.7, 0, TAU); c.fill();
+    c.fillStyle = `rgba(255,255,255,${pressImpact * 0.9})`;
+    c.fillRect(ramX - S * 0.05, anvilY - 2, ramW + S * 0.1, 4);
+  }
+
+  // ---- sparks: white-hot, bounce off the floor, die red
+  c.globalCompositeOperation = 'lighter';
+  const grav = S * 0.00045;
+  for (let i = pressSparks.length - 1; i >= 0; i--) {
+    const p = pressSparks[i];
+    p.vy += grav * 16; p.x += p.vx; p.y += p.vy;
+    if (p.y > H - 2 && p.vy > 0) { p.y = H - 2; p.vy *= -0.45; p.vx *= 0.7; p.life *= 0.7; }
+    p.life -= 0.014;
+    if (p.life <= 0) { pressSparks.splice(i, 1); continue; }
+    const heat = Math.min(1, p.life * 1.6);
+    c.strokeStyle = `rgba(255,${Math.round(90 + heat * 165)},${Math.round(30 + heat * 160)},${p.life})`;
+    c.lineWidth = p.r;
+    c.beginPath(); c.moveTo(p.x - p.vx * 1.6, p.y - p.vy * 1.6); c.lineTo(p.x, p.y); c.stroke();
+  }
+  if (pressSparks.length > 400) pressSparks.splice(0, pressSparks.length - 400);
+
+  c.restore();   // end shake
+
+  // ---- grime: scanlines + grain + pumping vignette
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.15)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  for (let i = 0; i < 70; i++) {
+    c.fillStyle = `rgba(255,255,255,${Math.random() * 0.06})`;
+    c.fillRect(Math.random() * W, Math.random() * H, 1.5, 1.5);
+  }
+  const vg = c.createRadialGradient(CX, CY, S * (0.3 + pressImpact * 0.15), CX, CY, S * 0.95);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.85)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 33 — BLACKOUT  (weaponised strobe — darkness ruled by the kick)
+   The room is void-black. Every kick detonates one hard flash in a
+   random pattern — full sheet, venetian bars, columns, shock rings,
+   X-beams, EQ teeth, checkerboard — white on the hit, decaying into a
+   blood-red afterimage burned across the dark. Between hits: a dying
+   ember pulse, a drifting scan line, and treble static.
+   ===================================================================== */
+function modeBlackout(c) {
+  const S = Math.min(W, H);
+  // heavy but not total clear — flashes leave ghosts that rot away
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.42)'; c.fillRect(0, 0, W, H);
+
+  // ---- arm a new flash on the kick
+  if (A.beatHit) {
+    boFlash = 1;
+    boPattern = (boPattern + 1 + (Math.random() * 3 | 0)) % 7;   // never the same twice
+    boSeed = (Math.random() * 1e9) | 0;
+  }
+  boFlash *= 0.78;
+  if (boFlash < 0.02) boFlash = 0;
+
+  // ---- idle life between hits (kept dim so the flash stays violent)
+  c.globalCompositeOperation = 'lighter';
+  const ember = 0.05 + A.bass * 0.12;
+  const eg = c.createRadialGradient(CX, CY, 0, CX, CY, S * 0.75);
+  eg.addColorStop(0, `rgba(140,8,8,${ember})`);
+  eg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = eg; c.beginPath(); c.arc(CX, CY, S * 0.75, 0, TAU); c.fill();
+  // drifting scan line
+  const sy = ((frame * 1.2) % (H + 80)) - 40;
+  c.fillStyle = `rgba(255,20,20,${0.05 + A.mid * 0.1})`;
+  c.fillRect(0, sy, W, 2);
+  // treble static
+  const nst = Math.round(A.treble * 60);
+  for (let i = 0; i < nst; i++) {
+    c.fillStyle = `rgba(255,${Math.random() < 0.3 ? 255 : 40},40,${Math.random() * 0.35})`;
+    c.fillRect(Math.random() * W, Math.random() * H, 2, 2);
+  }
+
+  // ---- THE FLASH
+  if (boFlash > 0) {
+    const t = boFlash;
+    // white right on the hit, bleeding to pure red as it dies
+    const gb = Math.round(255 * Math.max(0, (t - 0.45) / 0.55));
+    const col = (a) => `rgba(255,${gb},${gb},${Math.min(1, a)})`;
+    const rnd = mulberry32(boSeed);                 // frozen randoms → stable afterimage
+    c.globalCompositeOperation = 'lighter';
+    c.fillStyle = col(t);
+
+    switch (boPattern) {
+      case 0:                                        // full sheet
+        c.fillRect(0, 0, W, H);
+        break;
+      case 1: {                                      // venetian bars
+        const bh = H / (5 + (rnd() * 6 | 0));
+        for (let y = (rnd() < 0.5 ? 0 : bh); y < H; y += bh * 2) c.fillRect(0, y, W, bh);
+        break;
+      }
+      case 2: {                                      // columns
+        const bw = W / (4 + (rnd() * 8 | 0));
+        for (let x = (rnd() < 0.5 ? 0 : bw); x < W; x += bw * 2) c.fillRect(x, 0, bw, H);
+        break;
+      }
+      case 3: {                                      // shock rings, expanding as they fade
+        const ox = CX + (rnd() - 0.5) * W * 0.3, oy = CY + (rnd() - 0.5) * H * 0.3;
+        c.strokeStyle = col(t);
+        for (let k = 0; k < 5; k++) {
+          const r = (k + 1 + (1 - t) * 1.5) * S * 0.11;
+          c.lineWidth = S * 0.03 * t + 2;
+          c.beginPath(); c.arc(ox, oy, r, 0, TAU); c.stroke();
+        }
+        break;
+      }
+      case 4: {                                      // X-beams from the corners
+        const bw = S * (0.05 + rnd() * 0.1);
+        c.save(); c.translate(CX, CY); c.rotate((rnd() - 0.5) * 0.5);
+        const D = Math.hypot(W, H);
+        for (const a of [Math.atan2(H, W), Math.atan2(H, -W)]) {
+          c.save(); c.rotate(a);
+          c.fillRect(-D, -bw / 2, D * 2, bw);
+          c.restore();
+        }
+        c.restore();
+        break;
+      }
+      case 5: {                                      // EQ teeth — light everywhere EXCEPT the spectrum
+        c.save();
+        c.beginPath(); c.rect(0, 0, W, H);
+        const cols = 28, bw = W / cols;
+        for (let i = 0; i < cols; i++) {
+          const f = freq[Math.floor(Math.pow(i / cols, 1.3) * freq.length * 0.7)] / 255;
+          c.rect(i * bw + bw * 0.08, H - f * H * 0.95, bw * 0.84, f * H * 0.95);
+        }
+        c.clip('evenodd');
+        c.fillRect(0, 0, W, H);
+        c.restore();
+        break;
+      }
+      default: {                                     // checkerboard
+        const cs = S / (4 + (rnd() * 5 | 0));
+        const off = rnd() < 0.5 ? 0 : 1;
+        for (let gy = 0; gy * cs < H; gy++)
+          for (let gx = 0; gx * cs < W; gx++)
+            if ((gx + gy + off) % 2 === 0) c.fillRect(gx * cs, gy * cs, cs + 1, cs + 1);
+      }
+    }
+
+    // chromatic tear right on the hit
+    if (t > 0.6 && Math.random() < 0.8) {
+      c.globalCompositeOperation = 'source-over';
+      const n = 3 + (Math.random() * 6 | 0);
+      for (let s = 0; s < n; s++) {
+        const y = Math.random() * H, hh = 4 + Math.random() * H * 0.06;
+        c.drawImage(c.canvas, 0, y, W, hh, (Math.random() - 0.5) * W * 0.2 * t, y, W, hh);
+      }
+    }
+  }
+
+  // rolling scanlines keep it looking like surveillance footage
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.16)';
+  for (let y = frame % 3; y < H; y += 3) c.fillRect(0, y, W, 1);
+}
+
+/* =====================================================================
+   MODE 34 — TESLA  (high-voltage arc gap between two black pylons)
+   Two dead-black electrode towers. The mids and highs charge the gap;
+   the kick discharges it — a fat white-core bolt with a blood-red
+   corona rips across, spitting embers that rain down and die on the
+   floor. Small nervous arcs crawl the insulators between strikes.
+   ===================================================================== */
+function makeBolt(x1, y1, x2, y2, jag, segs) {
+  const pts = [{ x: x1, y: y1 }];
+  for (let i = 1; i < segs; i++) {
+    const t = i / segs;
+    pts.push({
+      x: x1 + (x2 - x1) * t + (Math.random() - 0.5) * jag * Math.sin(t * Math.PI),
+      y: y1 + (y2 - y1) * t + (Math.random() - 0.5) * jag * Math.sin(t * Math.PI),
+    });
+  }
+  pts.push({ x: x2, y: y2 });
+  return pts;
+}
+function strokeBolt(c, pts, w, core) {
+  // three passes: red corona → hot mid → white core
+  const passes = core
+    ? [[w * 4, `rgba(255,20,20,0.16)`], [w * 1.8, `rgba(255,90,80,0.5)`], [w * 0.7, `rgba(255,255,255,0.95)`]]
+    : [[w * 2.5, `rgba(255,30,30,0.2)`], [w, `rgba(255,120,110,0.6)`]];
+  for (const [lw, st] of passes) {
+    c.lineWidth = lw; c.strokeStyle = st;
+    c.beginPath(); c.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) c.lineTo(pts[i].x, pts[i].y);
+    c.stroke();
+  }
+}
+function modeTesla(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(2,0,2,0.5)'; c.fillRect(0, 0, W, H);
+
+  // pylon geometry
+  const tipY = H * 0.3, baseY = H;
+  const LX = W * 0.14, RX = W * 0.86;
+
+  // ---- discharge on the kick; extra crackle when the highs saturate
+  const charge = A.mid * 0.6 + A.treble * 0.5;
+  if (A.beatHit) teslaArcs.push({
+    life: 1, main: true,
+    jag: S * (0.08 + A.bass * 0.14),
+  });
+  if (Math.random() < charge * 0.25) teslaArcs.push({ life: 0.5, main: false, jag: S * 0.12 });
+
+  // ---- ambient scene light pumps with whatever is arcing
+  let glow = 0;
+  for (const a of teslaArcs) glow = Math.max(glow, a.life * (a.main ? 1 : 0.4));
+  c.globalCompositeOperation = 'lighter';
+  const lg = c.createRadialGradient(CX, tipY, 0, CX, tipY, S * 0.9);
+  lg.addColorStop(0, `rgba(255,60,50,${0.05 + glow * 0.25})`);
+  lg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = lg; c.beginPath(); c.arc(CX, tipY, S * 0.9, 0, TAU); c.fill();
+  // ground fog lit red
+  const fg = c.createLinearGradient(0, H * 0.8, 0, H);
+  fg.addColorStop(0, 'rgba(0,0,0,0)');
+  fg.addColorStop(1, `rgba(150,10,10,${0.1 + glow * 0.25 + A.bass * 0.12})`);
+  c.fillStyle = fg; c.fillRect(0, H * 0.8, W, H * 0.2);
+
+  // ---- the arcs (regenerated every frame while alive → they crackle)
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  for (let i = teslaArcs.length - 1; i >= 0; i--) {
+    const a = teslaArcs[i];
+    a.life -= a.main ? 0.09 : 0.14;
+    if (a.life <= 0) { teslaArcs.splice(i, 1); continue; }
+    const pts = makeBolt(LX, tipY, RX, tipY, a.jag * (0.6 + a.life), 26);
+    strokeBolt(c, pts, (a.main ? 3.2 : 1.6) * (S / 700) * (0.5 + a.life), a.main);
+    // branches forking off the spine
+    const nb = a.main ? 3 : 1;
+    for (let b = 0; b < nb; b++) {
+      const p = pts[4 + (Math.random() * (pts.length - 8) | 0)];
+      const bx = p.x + (Math.random() - 0.5) * S * 0.3;
+      const by = p.y + (Math.random() * 0.7 + 0.1) * S * 0.3;
+      strokeBolt(c, makeBolt(p.x, p.y, bx, by, S * 0.05, 8), 1.2 * (S / 700), false);
+    }
+    // embers spat from the bolt
+    if (a.main && Math.random() < 0.85) {
+      const p = pts[2 + (Math.random() * (pts.length - 4) | 0)];
+      teslaSparks.push({
+        x: p.x, y: p.y,
+        vx: (Math.random() - 0.5) * 3, vy: Math.random() * 1.5,
+        life: 0.6 + Math.random() * 0.4,
+      });
+    }
+  }
+
+  // ---- falling embers
+  for (let i = teslaSparks.length - 1; i >= 0; i--) {
+    const p = teslaSparks[i];
+    p.vy += 0.12; p.x += p.vx; p.y += p.vy; p.life -= 0.012;
+    if (p.life <= 0 || p.y > H) { teslaSparks.splice(i, 1); continue; }
+    const heat = Math.min(1, p.life * 1.8);
+    c.fillStyle = `rgba(255,${Math.round(60 + heat * 180)},${Math.round(40 + heat * 120)},${p.life})`;
+    c.fillRect(p.x, p.y, 2, 2 + p.vy);
+  }
+  if (teslaSparks.length > 240) teslaSparks.splice(0, teslaSparks.length - 240);
+
+  // ---- nervous little arcs crawling the insulator stacks between strikes
+  for (const x of [LX, RX]) if (Math.random() < 0.2 + charge * 0.3) {
+    const y = tipY + Math.random() * S * 0.12;
+    strokeBolt(c, makeBolt(x - S * 0.025, y, x + S * 0.025, y + S * 0.03, S * 0.02, 6), 0.9 * (S / 700), false);
+  }
+
+  // ---- pylons: dead-black towers with cross bracing + insulator stacks
+  c.globalCompositeOperation = 'source-over';
+  for (const [x, dir] of [[LX, 1], [RX, -1]]) {
+    const wTop = S * 0.02, wBase = S * 0.085;
+    c.fillStyle = '#000';
+    c.beginPath();
+    c.moveTo(x - wTop, tipY + S * 0.03);
+    c.lineTo(x + wTop, tipY + S * 0.03);
+    c.lineTo(x + wBase, baseY); c.lineTo(x - wBase, baseY);
+    c.closePath(); c.fill();
+    // cross bracing
+    c.strokeStyle = '#000'; c.lineWidth = S * 0.011;
+    for (let k = 0; k < 5; k++) {
+      const t0 = k / 5, t1 = (k + 1) / 5;
+      const y0 = tipY + S * 0.03 + (baseY - tipY - S * 0.03) * t0;
+      const y1 = tipY + S * 0.03 + (baseY - tipY - S * 0.03) * t1;
+      const w0 = wTop + (wBase - wTop) * t0, w1 = wTop + (wBase - wTop) * t1;
+      c.beginPath(); c.moveTo(x - w0 - S * 0.02, y0); c.lineTo(x + w1 + S * 0.02, y1); c.stroke();
+      c.beginPath(); c.moveTo(x + w0 + S * 0.02, y0); c.lineTo(x - w1 - S * 0.02, y1); c.stroke();
+    }
+    // insulator stack up to the electrode tip
+    c.fillStyle = '#020202';
+    for (let k = 0; k < 4; k++) {
+      c.beginPath();
+      c.ellipse(x, tipY + S * 0.028 - k * S * 0.014, S * (0.022 - k * 0.003), S * 0.006, 0, 0, TAU);
+      c.fill();
+    }
+    // electrode ball — rim-lit by whatever is arcing
+    c.beginPath(); c.arc(x, tipY, S * 0.012, 0, TAU); c.fill();
+    c.globalCompositeOperation = 'lighter';
+    c.fillStyle = `rgba(255,80,60,${0.2 + glow * 0.8})`;
+    c.beginPath(); c.arc(x, tipY, S * 0.012, 0, TAU); c.fill();
+    // blinking aircraft-warning lamp halfway up
+    const blink = 0.3 + Math.sin(frame * 0.08 + dir) * 0.3 + A.beat * 0.4;
+    c.fillStyle = `rgba(255,20,20,${Math.max(0, blink)})`;
+    c.beginPath(); c.arc(x, tipY + (baseY - tipY) * 0.4, S * 0.006, 0, TAU); c.fill();
+    c.globalCompositeOperation = 'source-over';
+  }
+
+  // ---- grime
+  c.fillStyle = 'rgba(0,0,0,0.15)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * 0.35, CX, CY, S);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.8)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 35 — SHAFT  (freefall down a bottomless industrial shaft)
+   One-point-perspective drop: square girder frames rush past, the bass
+   is the throttle. Every few frames a ring carries red warning lamps;
+   some rings are strobe rings that detonate white as the kick lands.
+   Radial speed-streaks and a wandering vanishing point sell the fall.
+   ===================================================================== */
+function shaftHash(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+function modeShaft(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#010102'; c.fillRect(0, 0, W, H);
+
+  // ---- throttle: the low end is the fall speed
+  const speed = 0.14 + A.bass * 0.5 + A.beat * 0.35;
+  shaftZ += speed;
+  if (A.beatHit) shaftShake = 1;
+  shaftShake *= 0.85;
+
+  // wandering vanishing point + kick jolt
+  const vx = CX + Math.sin(frame * 0.006) * W * 0.05 + (Math.random() - 0.5) * shaftShake * S * 0.02;
+  const vy = CY + Math.cos(frame * 0.0043) * H * 0.05 + (Math.random() - 0.5) * shaftShake * S * 0.02;
+  const roll = Math.sin(frame * 0.004) * 0.09 + A.mid * 0.03;
+
+  c.save();
+  c.translate(vx, vy); c.rotate(roll);
+
+  const GAP = 1, N = 26, FL = 1.6;
+  const base = Math.floor(shaftZ / GAP);
+  const frac = shaftZ % GAP;
+
+  // ---- corner rails converging on the vanishing point
+  c.strokeStyle = 'rgba(70,70,80,0.5)'; c.lineWidth = Math.max(1, S * 0.004);
+  const far = FL / (N * GAP), near = 2.2;
+  for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+    c.beginPath();
+    c.moveTo(sx * S * 0.62 * far, sy * S * 0.62 * far);
+    c.lineTo(sx * S * 0.62 * near, sy * S * 0.62 * near);
+    c.stroke();
+  }
+
+  // ---- girder rings, far → near
+  for (let k = N; k >= 0; k--) {
+    const z = k * GAP - frac + 0.12;
+    if (z <= 0.02) continue;
+    const p = FL / z;                       // perspective scale
+    const hs = S * 0.62 * p;                // ring half-size
+    if (hs > S * 2.2) continue;             // already past the camera
+    const fog = Math.min(1, Math.max(0, 1.15 - z / (N * GAP * 0.8)));
+    const idx = base + k;                   // stable world identity
+    const h1 = shaftHash(idx);
+
+    if (h1 < 0.55) {
+      // plain steel girder frame
+      c.strokeStyle = `rgba(${100 + fog * 40},${102 + fog * 40},${115 + fog * 40},${fog * 0.75})`;
+      c.lineWidth = Math.max(1, hs * 0.045);
+      c.strokeRect(-hs, -hs, hs * 2, hs * 2);
+      // rivet ticks on the near rings
+      if (p > 0.5) {
+        c.fillStyle = `rgba(160,160,175,${fog * 0.5})`;
+        for (let r = 0; r < 4; r++) {
+          const t = -hs + (r + 0.5) * hs * 0.5;
+          c.fillRect(t, -hs - hs * 0.02, hs * 0.03, hs * 0.04);
+          c.fillRect(t, hs - hs * 0.02, hs * 0.03, hs * 0.04);
+        }
+      }
+    } else if (h1 < 0.85) {
+      // warning ring — red lamps in the corners, glow pooling on the steel
+      c.strokeStyle = `rgba(60,58,66,${fog * 0.8})`;
+      c.lineWidth = Math.max(1, hs * 0.05);
+      c.strokeRect(-hs, -hs, hs * 2, hs * 2);
+      c.globalCompositeOperation = 'lighter';
+      const lampA = (0.4 + Math.sin(frame * 0.1 + idx * 2.1) * 0.25 + A.bass * 0.3) * fog;
+      for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        const g = c.createRadialGradient(sx * hs, sy * hs, 0, sx * hs, sy * hs, hs * 0.5);
+        g.addColorStop(0, `rgba(255,25,20,${lampA})`);
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        c.fillStyle = g;
+        c.beginPath(); c.arc(sx * hs, sy * hs, hs * 0.5, 0, TAU); c.fill();
+        c.fillStyle = `rgba(255,90,70,${Math.min(1, lampA * 2)})`;
+        c.beginPath(); c.arc(sx * hs, sy * hs, Math.max(1, hs * 0.035), 0, TAU); c.fill();
+      }
+      c.globalCompositeOperation = 'source-over';
+    } else {
+      // strobe ring — detonates white when the kick lands
+      const st = Math.max(A.beat * 1.4 - 0.4, 0.06) * fog;
+      c.globalCompositeOperation = 'lighter';
+      c.strokeStyle = `rgba(255,255,255,${Math.min(1, st)})`;
+      c.lineWidth = Math.max(1, hs * (0.05 + A.beat * 0.06));
+      c.strokeRect(-hs, -hs, hs * 2, hs * 2);
+      if (st > 0.4) {                       // hot bloom around the frame
+        c.strokeStyle = `rgba(255,40,40,${st * 0.5})`;
+        c.lineWidth = hs * 0.16;
+        c.strokeRect(-hs, -hs, hs * 2, hs * 2);
+      }
+      c.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  // ---- radial speed streaks — dust ripping past the camera
+  c.globalCompositeOperation = 'lighter';
+  const ns = Math.round(14 + speed * 60);
+  for (let i = 0; i < ns; i++) {
+    const a = shaftHash(i * 7.3) * TAU;
+    const d = ((shaftHash(i * 3.1) * 900 + frame * (3 + speed * 26)) % 900) / 900;   // 0 far → 1 near
+    const r0 = S * (0.05 + d * d * 1.3), r1 = r0 + S * 0.02 + speed * S * 0.12 * d;
+    const al = d * 0.4 * (0.4 + speed);
+    c.strokeStyle = shaftHash(i * 11.7) < 0.2 ? `rgba(255,50,40,${al})` : `rgba(200,205,220,${al * 0.7})`;
+    c.lineWidth = 1 + d * 1.5;
+    c.beginPath();
+    c.moveTo(Math.cos(a) * r0, Math.sin(a) * r0);
+    c.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+    c.stroke();
+  }
+
+  // ---- the bottom of the shaft: a red glow that pumps with the bass
+  const bg2 = c.createRadialGradient(0, 0, 0, 0, 0, S * 0.2);
+  bg2.addColorStop(0, `rgba(255,30,20,${0.25 + A.bass * 0.5})`);
+  bg2.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bg2; c.beginPath(); c.arc(0, 0, S * 0.2, 0, TAU); c.fill();
+
+  // kick strobe out of the depths
+  if (A.beat > 0.55) {
+    const kg = c.createRadialGradient(0, 0, 0, 0, 0, S * 1.1);
+    kg.addColorStop(0, `rgba(255,255,255,${(A.beat - 0.55) * 1.4})`);
+    kg.addColorStop(0.4, `rgba(255,30,30,${(A.beat - 0.55) * 0.7})`);
+    kg.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = kg; c.beginPath(); c.arc(0, 0, S * 1.1, 0, TAU); c.fill();
+  }
+
+  c.restore();
+
+  // ---- grime: scanlines + vignette
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.14)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * 0.4, CX, CY, S);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.75)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 36 — MONOLITH  (black slab in red haze — it cracks on the kick)
+   A dead-black slab towers over a reflective floor. Bass makes it hum;
+   every hard kick tears a new glowing fissure across its face, spits
+   spall chips, and flares every existing crack white before they cool
+   back to ember red. Dust drifts through the haze. Pure menace —
+   built for breakdowns and the drop that follows.
+   ===================================================================== */
+function modeMonolith(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#020102'; c.fillRect(0, 0, W, H);
+
+  // slab geometry (slight taper for menace)
+  const baseY = H * 0.84, topY = baseY - S * 0.62;
+  const wB = S * 0.12, wT = wB * 0.92;
+  const rumble = A.bass * S * 0.003;
+  const ox = (Math.random() - 0.5) * rumble, oy = (Math.random() - 0.5) * rumble;
+
+  // ---- red haze horizon behind the slab
+  const hz = c.createRadialGradient(CX, baseY, 0, CX, baseY, S * 0.85);
+  hz.addColorStop(0, `rgba(130,10,10,${0.22 + A.bass * 0.3 + A.beat * 0.25})`);
+  hz.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = hz; c.beginPath(); c.arc(CX, baseY, S * 0.85, 0, TAU); c.fill();
+
+  // ---- drifting dust, lit by the haze
+  if (monoDust.length < 60 && Math.random() < 0.5) monoDust.push({
+    x: Math.random() * W, y: H * (0.2 + Math.random() * 0.7),
+    vx: (Math.random() - 0.5) * 0.4, vy: -(0.08 + Math.random() * 0.25),
+    r: 0.6 + Math.random() * 1.6, ph: Math.random() * TAU, life: 1,
+  });
+  c.globalCompositeOperation = 'lighter';
+  for (let i = monoDust.length - 1; i >= 0; i--) {
+    const p = monoDust[i];
+    p.x += p.vx + Math.sin(frame * 0.008 + p.ph) * 0.25; p.y += p.vy; p.life -= 0.003;
+    if (p.life <= 0 || p.y < 0) { monoDust.splice(i, 1); continue; }
+    const lit = Math.max(0, 1 - Math.abs(p.y - baseY) / (S * 0.8));
+    c.fillStyle = `rgba(255,90,80,${p.life * lit * 0.28})`;
+    c.fillRect(p.x, p.y, p.r, p.r);
+  }
+
+  // ---- new fissure + flare on the hard kick
+  if (A.beatHit && A.bass > 0.35) {
+    const pts = [];
+    let px = CX + (Math.random() - 0.5) * wT * 1.5;
+    let py = topY + Math.random() * S * 0.14;
+    pts.push({ x: px, y: py });
+    const n = 6 + (Math.random() * 8 | 0);
+    for (let k = 0; k < n; k++) {
+      px += (Math.random() - 0.5) * wB * 0.9;
+      px = Math.max(CX - wB * 0.92, Math.min(CX + wB * 0.92, px));
+      py += (S * 0.62 / n) * (0.5 + Math.random());
+      if (py > baseY - 4) break;
+      pts.push({ x: px, y: py });
+    }
+    monoCracks.push({ pts, heat: 1 });
+    for (const cr of monoCracks) cr.heat = Math.max(cr.heat, 0.85);   // every scar flares
+    if (monoCracks.length > 9) monoCracks.shift();
+    // spall chips blown off the face
+    const src = pts[(Math.random() * pts.length) | 0];
+    for (let k = 0; k < 14; k++) monoSpall.push({
+      x: src.x, y: src.y,
+      vx: (Math.random() - 0.5) * 6, vy: -Math.random() * 4,
+      r: 1 + Math.random() * 2.5, life: 1,
+    });
+  }
+
+  // ---- the slab: black over everything, thin red rim on the haze side
+  const slab = (alpha) => {
+    c.globalAlpha = alpha;
+    c.fillStyle = '#000';
+    c.beginPath();
+    c.moveTo(CX - wT + ox, topY + oy); c.lineTo(CX + wT + ox, topY + oy);
+    c.lineTo(CX + wB + ox, baseY + oy); c.lineTo(CX - wB + ox, baseY + oy);
+    c.closePath(); c.fill();
+    c.strokeStyle = `rgba(255,30,25,${(0.16 + A.bass * 0.3) * alpha})`;
+    c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(CX - wT + ox, topY + oy); c.lineTo(CX - wB + ox, baseY + oy); c.stroke();
+    c.globalAlpha = 1;
+  };
+  c.globalCompositeOperation = 'source-over';
+  slab(1);
+
+  // ---- fissures: ember red at rest, white when fresh
+  c.lineCap = 'round';
+  for (const cr of monoCracks) {
+    cr.heat = Math.max(0.12, cr.heat * 0.965);          // cools but never fully dies
+    const h2 = cr.heat;
+    const passes = [
+      [S * 0.012 * h2 + 2, `rgba(255,20,15,${h2 * 0.3})`],
+      [Math.max(1, S * 0.004 * h2), h2 > 0.7
+        ? `rgba(255,${Math.round(120 + h2 * 135)},${Math.round(90 + h2 * 165)},${h2})`
+        : `rgba(255,${Math.round(40 + h2 * 90)},20,${0.3 + h2 * 0.7})`],
+    ];
+    c.globalCompositeOperation = 'lighter';
+    for (const [lw, st] of passes) {
+      c.strokeStyle = st; c.lineWidth = lw;
+      c.beginPath(); c.moveTo(cr.pts[0].x + ox, cr.pts[0].y + oy);
+      for (let i = 1; i < cr.pts.length; i++) c.lineTo(cr.pts[i].x + ox, cr.pts[i].y + oy);
+      c.stroke();
+    }
+  }
+
+  // ---- spall chips
+  for (let i = monoSpall.length - 1; i >= 0; i--) {
+    const p = monoSpall[i];
+    p.vy += 0.18; p.x += p.vx; p.y += p.vy; p.life -= 0.02;
+    if (p.life <= 0 || p.y > baseY) { monoSpall.splice(i, 1); continue; }
+    c.fillStyle = `rgba(255,${Math.round(60 + p.life * 140)},50,${p.life})`;
+    c.fillRect(p.x, p.y, p.r, p.r);
+  }
+
+  // ---- reflective floor: flipped ghost of the slab + fissure glow
+  c.save();
+  c.globalCompositeOperation = 'lighter';
+  c.translate(0, baseY * 2); c.scale(1, -1);
+  c.globalAlpha = 0.14;
+  for (const cr of monoCracks) {
+    c.strokeStyle = `rgba(255,50,30,${cr.heat * 0.8})`;
+    c.lineWidth = Math.max(1, S * 0.004);
+    c.beginPath(); c.moveTo(cr.pts[0].x, cr.pts[0].y);
+    for (let i = 1; i < cr.pts.length; i++) c.lineTo(cr.pts[i].x, cr.pts[i].y);
+    c.stroke();
+  }
+  c.globalAlpha = 1;
+  c.restore();
+  // floor sheen fading down
+  const fs = c.createLinearGradient(0, baseY, 0, H);
+  fs.addColorStop(0, `rgba(90,6,6,${0.18 + A.bass * 0.2})`);
+  fs.addColorStop(1, 'rgba(0,0,0,0)');
+  c.globalCompositeOperation = 'lighter';
+  c.fillStyle = fs; c.fillRect(0, baseY, W, H - baseY);
+
+  // ---- kick flash bleeding out of the scars
+  if (A.beat > 0.6) {
+    const kg = c.createRadialGradient(CX, CY, 0, CX, CY, S * 0.9);
+    kg.addColorStop(0, `rgba(255,60,45,${(A.beat - 0.6) * 0.8})`);
+    kg.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = kg; c.beginPath(); c.arc(CX, CY, S * 0.9, 0, TAU); c.fill();
+  }
+
+  // ---- grime
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.15)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * 0.32, CX, CY, S * 0.95);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.82)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 37 — GRINDER  (two interlocked gears chewing sparks)
+   Two monstrous black gears mesh at screen centre in front of a
+   pumping red backlight. The bass is the motor; the kick makes the
+   drive catch and jolt. The mesh point grinds a constant stream of
+   sparks — a full shower on the hit — and metal shavings rain out.
+   ===================================================================== */
+function drawGear(c, x, y, R, teeth, rot, rimGlow) {
+  c.save(); c.translate(x, y); c.rotate(rot);
+  c.fillStyle = '#020203';
+  c.beginPath();
+  const inner = R * 0.86, outer = R * 1.06, half = Math.PI / teeth * 0.42;
+  for (let i = 0; i < teeth; i++) {
+    const a = i / teeth * TAU;
+    c.lineTo(Math.cos(a - half * 1.9) * inner, Math.sin(a - half * 1.9) * inner);
+    c.lineTo(Math.cos(a - half) * outer, Math.sin(a - half) * outer);
+    c.lineTo(Math.cos(a + half) * outer, Math.sin(a + half) * outer);
+    c.lineTo(Math.cos(a + half * 1.9) * inner, Math.sin(a + half * 1.9) * inner);
+  }
+  c.closePath(); c.fill();
+  // hub + bolt ring
+  c.beginPath(); c.arc(0, 0, R * 0.22, 0, TAU); c.fill();
+  c.fillStyle = '#0a0a0c';
+  for (let i = 0; i < 6; i++) {
+    const a = i / 6 * TAU;
+    c.beginPath(); c.arc(Math.cos(a) * R * 0.5, Math.sin(a) * R * 0.5, R * 0.05, 0, TAU); c.fill();
+  }
+  // red rim light off the backlight
+  c.globalCompositeOperation = 'lighter';
+  c.strokeStyle = `rgba(255,25,20,${rimGlow})`;
+  c.lineWidth = Math.max(1.5, R * 0.02);
+  c.beginPath(); c.arc(0, 0, inner * 0.995, 0, TAU); c.stroke();
+  c.globalCompositeOperation = 'source-over';
+  c.restore();
+}
+function modeGrinder(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(2,1,1,0.6)'; c.fillRect(0, 0, W, H);
+
+  // ---- motor: bass drives, kick catches the drive and jolts it
+  if (A.beatHit) grindJolt = 1;
+  grindJolt *= 0.82;
+  const rpm = 0.006 + A.bass * 0.05 + grindJolt * 0.12;
+  grindRot += Math.random() < 0.03 ? -rpm * 1.8 : rpm;   // the odd tooth slips backwards
+
+  const R = S * 0.34, teeth = 12;
+  const meshX = CX, meshY = CY;
+  const shk = grindJolt * S * 0.012;
+  c.save();
+  c.translate((Math.random() - 0.5) * shk * 2, (Math.random() - 0.5) * shk * 2);
+
+  // ---- pumping backlight behind the mesh
+  c.globalCompositeOperation = 'lighter';
+  const bl = c.createRadialGradient(meshX, meshY, 0, meshX, meshY, S * 0.75);
+  bl.addColorStop(0, `rgba(200,15,12,${0.3 + A.bass * 0.4 + grindJolt * 0.35})`);
+  bl.addColorStop(0.55, `rgba(120,8,8,${0.12 + A.bass * 0.15})`);
+  bl.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bl; c.beginPath(); c.arc(meshX, meshY, S * 0.75, 0, TAU); c.fill();
+  c.globalCompositeOperation = 'source-over';
+
+  // ---- the gears (phases offset half a tooth so they interleave)
+  const rim = 0.15 + A.bass * 0.35 + grindJolt * 0.4;
+  drawGear(c, meshX - R * 1.04, meshY, R, teeth, grindRot, rim);
+  drawGear(c, meshX + R * 1.04, meshY, R, teeth, -grindRot + Math.PI / teeth, rim);
+
+  // ---- sparks ground out of the mesh point
+  const burst = A.beatHit ? 26 + Math.round(A.bass * 40) : (Math.random() < 0.3 + A.level * 0.5 ? 2 : 0);
+  for (let k = 0; k < burst; k++) {
+    const up = Math.random() < 0.5 ? -1 : 1;
+    grindSparks.push({
+      x: meshX + (Math.random() - 0.5) * R * 0.16,
+      y: meshY + (Math.random() - 0.5) * R * 0.3,
+      vx: (Math.random() - 0.5) * 7 * (S / 600),
+      vy: up * (2 + Math.random() * 6) * (S / 600),
+      life: 0.5 + Math.random() * 0.5, r: 1 + Math.random() * 1.8,
+    });
+  }
+  c.globalCompositeOperation = 'lighter';
+  for (let i = grindSparks.length - 1; i >= 0; i--) {
+    const p = grindSparks[i];
+    p.vy += 0.14; p.x += p.vx; p.y += p.vy; p.life -= 0.016;
+    if (p.life <= 0 || p.y > H) { grindSparks.splice(i, 1); continue; }
+    const heat = Math.min(1, p.life * 1.7);
+    c.strokeStyle = `rgba(255,${Math.round(90 + heat * 165)},${Math.round(30 + heat * 150)},${p.life})`;
+    c.lineWidth = p.r;
+    c.beginPath(); c.moveTo(p.x - p.vx * 1.5, p.y - p.vy * 1.5); c.lineTo(p.x, p.y); c.stroke();
+  }
+  if (grindSparks.length > 320) grindSparks.splice(0, grindSparks.length - 320);
+  // white-hot grinding core right at the mesh
+  const mg = c.createRadialGradient(meshX, meshY, 0, meshX, meshY, R * 0.34);
+  mg.addColorStop(0, `rgba(255,230,210,${0.25 + A.level * 0.4 + grindJolt * 0.5})`);
+  mg.addColorStop(0.4, `rgba(255,70,30,${0.2 + A.bass * 0.3})`);
+  mg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = mg; c.beginPath(); c.arc(meshX, meshY, R * 0.34, 0, TAU); c.fill();
+
+  // ---- metal shavings raining out of the mesh
+  if (Math.random() < 0.25 + A.level * 0.4) grindShav.push({
+    x: meshX + (Math.random() - 0.5) * R * 0.3, y: meshY + R * 0.2,
+    vx: (Math.random() - 0.5) * 2, vy: 1 + Math.random() * 2,
+    a: Math.random() * TAU, va: (Math.random() - 0.5) * 0.4, life: 1,
+  });
+  c.globalCompositeOperation = 'source-over';
+  for (let i = grindShav.length - 1; i >= 0; i--) {
+    const p = grindShav[i];
+    p.vy += 0.12; p.x += p.vx; p.y += p.vy; p.a += p.va; p.life -= 0.012;
+    if (p.life <= 0 || p.y > H + 6) { grindShav.splice(i, 1); continue; }
+    c.save(); c.translate(p.x, p.y); c.rotate(p.a);
+    c.fillStyle = `rgba(140,140,150,${p.life * 0.7})`;
+    c.fillRect(-2.5, -0.8, 5, 1.6);
+    c.restore();
+  }
+
+  c.restore();   // end jolt shake
+
+  // ---- kick strobe pop
+  if (A.beat > 0.75) {
+    c.globalCompositeOperation = 'lighter';
+    c.fillStyle = Math.random() < 0.3
+      ? `rgba(255,255,255,${(A.beat - 0.75) * 0.9})`
+      : `rgba(220,10,10,${(A.beat - 0.75) * 1.2})`;
+    c.fillRect(0, 0, W, H);
+  }
+
+  // ---- grime
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.16)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * 0.3, CX, CY, S * 0.95);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.85)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 38 — SENTINEL  (machine eye scanning the dark — lock-on strobe)
+   A black visor spans the top of the room; inside it a red iris sweeps
+   like a cylon. Every kick makes it LOCK: the iris flares white and a
+   hard cone of light snaps onto a random spot on the floor. Treble
+   feeds nervous data-glitch ticks along the visor edge.
+   ===================================================================== */
+function modeSentinel(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(1,1,2,0.5)'; c.fillRect(0, 0, W, H);
+
+  const visW = W * 0.72, visH = S * 0.075, visY = H * 0.22;
+  const visX = CX - visW / 2;
+
+  // ---- sweep / lock state
+  if (A.beatHit) {
+    sentLock = 10 + Math.round(A.bass * 10);
+    sentTarget = 0.12 + Math.random() * 0.76;   // where the cone slams down
+    sentFlare = 1;
+  }
+  if (sentLock > 0) sentLock--;
+  else {
+    sentX += sentDir * (0.012 + A.mid * 0.035);
+    if (sentX > 1) { sentX = 1; sentDir = -1; }
+    if (sentX < 0) { sentX = 0; sentDir = 1; }
+  }
+  sentFlare *= 0.86;
+  const irisX = visX + visW * (0.06 + sentX * 0.88);
+  const irisY = visY + visH / 2;
+
+  // ---- lock-on cone + floor pool (behind the visor)
+  if (sentLock > 0 || sentFlare > 0.1) {
+    const tx = W * sentTarget, ty = H * 0.9;
+    const spread = W * 0.05 + sentFlare * W * 0.03;
+    const coneA = 0.25 + sentFlare * 0.55;
+    c.globalCompositeOperation = 'lighter';
+    const cg = c.createLinearGradient(irisX, irisY, tx, ty);
+    cg.addColorStop(0, `rgba(255,${sentFlare > 0.5 ? 220 : 40},40,${coneA})`);
+    cg.addColorStop(1, `rgba(255,10,10,${coneA * 0.25})`);
+    c.fillStyle = cg;
+    c.beginPath();
+    c.moveTo(irisX, irisY);
+    c.lineTo(tx - spread, ty); c.lineTo(tx + spread, ty);
+    c.closePath(); c.fill();
+    // hot pool on the floor
+    const pg = c.createRadialGradient(tx, ty, 0, tx, ty, spread * 2.4);
+    pg.addColorStop(0, `rgba(255,60,45,${coneA * 0.8})`);
+    pg.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = pg;
+    c.beginPath(); c.ellipse(tx, ty, spread * 2.4, spread * 0.8, 0, 0, TAU); c.fill();
+  }
+
+  // ---- idle sweep glow raking the floor as the iris patrols
+  if (sentLock <= 0) {
+    const fx = W * (0.1 + sentX * 0.8);
+    c.globalCompositeOperation = 'lighter';
+    const ig = c.createRadialGradient(fx, H * 0.92, 0, fx, H * 0.92, S * 0.3);
+    ig.addColorStop(0, `rgba(180,15,15,${0.10 + A.mid * 0.12})`);
+    ig.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = ig;
+    c.beginPath(); c.ellipse(fx, H * 0.92, S * 0.3, S * 0.1, 0, 0, TAU); c.fill();
+  }
+
+  // ---- chassis: cables hanging off the visor housing
+  c.globalCompositeOperation = 'source-over';
+  c.strokeStyle = '#000'; c.lineCap = 'round';
+  for (let i = 0; i < 5; i++) {
+    const cx0 = visX + visW * (0.1 + i * 0.2);
+    const sway = Math.sin(frame * 0.015 + i * 1.7) * (4 + A.bass * 10);
+    c.lineWidth = S * 0.008 * (1 + (i % 2) * 0.5);
+    c.beginPath();
+    c.moveTo(cx0, 0);
+    c.quadraticCurveTo(cx0 + sway, visY * 0.55, cx0 + sway * 0.4, visY);
+    c.stroke();
+  }
+
+  // ---- the visor slab
+  roundRect(c, visX, visY, visW, visH, visH * 0.5);
+  c.fillStyle = '#050506'; c.fill();
+  c.strokeStyle = `rgba(255,25,20,${0.18 + A.bass * 0.25 + sentFlare * 0.5})`;
+  c.lineWidth = 1.5; c.stroke();
+
+  // ---- iris: red on patrol, white when locked — with a motion-trail smear
+  c.save();
+  roundRect(c, visX + 2, visY + 2, visW - 4, visH - 4, visH * 0.5);
+  c.clip();
+  c.globalCompositeOperation = 'lighter';
+  const trailDir = sentLock > 0 ? 0 : -sentDir;
+  const tg = c.createLinearGradient(irisX + trailDir * visW * 0.22, irisY, irisX, irisY);
+  tg.addColorStop(0, 'rgba(255,0,0,0)');
+  tg.addColorStop(1, `rgba(255,20,15,${0.5 + A.mid * 0.3})`);
+  c.fillStyle = tg;
+  c.fillRect(Math.min(irisX, irisX + trailDir * visW * 0.22), visY, Math.abs(trailDir) * visW * 0.22 || 1, visH);
+  const hot = sentFlare > 0.4;
+  const eg = c.createRadialGradient(irisX, irisY, 0, irisX, irisY, visH * 1.4);
+  eg.addColorStop(0, hot ? `rgba(255,255,255,${0.9})` : `rgba(255,60,45,${0.85})`);
+  eg.addColorStop(0.35, `rgba(255,15,10,${0.5 + sentFlare * 0.4})`);
+  eg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = eg;
+  c.beginPath(); c.arc(irisX, irisY, visH * 1.4, 0, TAU); c.fill();
+  c.restore();
+
+  // ---- treble data-glitch ticks along the visor
+  const nt = Math.round(A.treble * 26);
+  c.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < nt; i++) {
+    const x = visX + Math.random() * visW;
+    c.fillStyle = `rgba(255,${Math.random() < 0.25 ? 230 : 30},30,${0.2 + Math.random() * 0.5})`;
+    c.fillRect(x, visY - 4 - Math.random() * 8, 1.5 + Math.random() * 2, 2);
+  }
+
+  // ---- lock flash: one hard full-frame pop the instant it locks
+  if (sentFlare > 0.7) {
+    c.fillStyle = `rgba(255,255,255,${(sentFlare - 0.7) * 1.6})`;
+    c.fillRect(0, 0, W, H);
+  }
+
+  // ---- grime
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.16)';
+  for (let y = frame % 3; y < H; y += 3) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * 0.34, CX, CY, S);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.8)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 39 — RAZOR  (laser cuts — the kick slices the frame itself)
+   Darkness. Every kick draws a white-hot laser cut clean across the
+   screen at a new angle and SHEARS the two halves of the picture apart
+   along it for a few frames. Old cuts stay as cooling red seams that
+   drip molten beads. The frame itself is the victim.
+   ===================================================================== */
+function modeRazor(c) {
+  const S = Math.min(W, H);
+  const D = Math.hypot(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(1,0,1,0.32)'; c.fillRect(0, 0, W, H);
+
+  // ---- new cut on the kick
+  if (A.beatHit) {
+    const th = Math.random() * Math.PI;
+    const px = W * (0.25 + Math.random() * 0.5), py = H * (0.25 + Math.random() * 0.5);
+    razorSeams.push({ th, px, py, heat: 1 });
+    if (razorSeams.length > 6) razorSeams.shift();
+    razorShear = { th, px, py, t: 1 };
+  }
+
+  // ---- shear the frame apart along the newest cut
+  if (razorShear && razorShear.t > 0.06) {
+    const { th, px, py, t } = razorShear;
+    const dx = Math.cos(th), dy = Math.sin(th);        // along the cut
+    const nx = -dy, ny = dx;                            // normal
+    const shift = S * 0.028 * t;
+    const cw = c.canvas.width, ch = c.canvas.height;
+    for (const side of [1, -1]) {
+      c.save();
+      c.beginPath();                                    // half-plane on this side of the cut
+      c.moveTo(px - dx * D, py - dy * D);
+      c.lineTo(px + dx * D, py + dy * D);
+      c.lineTo(px + dx * D + nx * side * D, py + dy * D + ny * side * D);
+      c.lineTo(px - dx * D + nx * side * D, py - dy * D + ny * side * D);
+      c.closePath(); c.clip();
+      c.drawImage(c.canvas, 0, 0, cw, ch,
+        dx * side * shift + nx * side * shift * 0.4,
+        dy * side * shift + ny * side * shift * 0.4, W, H);
+      c.restore();
+    }
+    razorShear.t *= 0.78;
+  }
+
+  // ---- seams: white-hot core cooling to a red scar
+  c.lineCap = 'round';
+  c.globalCompositeOperation = 'lighter';
+  for (let i = razorSeams.length - 1; i >= 0; i--) {
+    const sm = razorSeams[i];
+    sm.heat *= 0.975;
+    if (sm.heat < 0.05) { razorSeams.splice(i, 1); continue; }
+    const { th, px, py, heat } = sm;
+    const dx = Math.cos(th), dy = Math.sin(th);
+    const x0 = px - dx * D, y0 = py - dy * D, x1 = px + dx * D, y1 = py + dy * D;
+    // wide cooling glow
+    c.strokeStyle = `rgba(255,15,10,${heat * 0.30})`;
+    c.lineWidth = S * 0.02 * heat + 2;
+    c.beginPath(); c.moveTo(x0, y0); c.lineTo(x1, y1); c.stroke();
+    // core: white when fresh, ember red as it cools
+    const g2 = Math.round(240 * Math.max(0, (heat - 0.35) / 0.65));
+    c.strokeStyle = `rgba(255,${g2},${g2},${0.35 + heat * 0.65})`;
+    c.lineWidth = Math.max(1, S * 0.005 * heat);
+    c.beginPath(); c.moveTo(x0, y0); c.lineTo(x1, y1); c.stroke();
+    // molten beads dripping off a fresh cut
+    if (heat > 0.55 && Math.random() < 0.7) {
+      const tt = Math.random() * 2 - 1;
+      razorDrops.push({
+        x: px + dx * tt * D * 0.4, y: py + dy * tt * D * 0.4,
+        vx: (Math.random() - 0.5) * 1.2, vy: 0.5 + Math.random() * 1.5,
+        life: 0.7 + Math.random() * 0.3,
+      });
+    }
+  }
+
+  // ---- molten drips
+  for (let i = razorDrops.length - 1; i >= 0; i--) {
+    const p = razorDrops[i];
+    p.vy += 0.1; p.x += p.vx; p.y += p.vy; p.life -= 0.014;
+    if (p.life <= 0 || p.y > H + 4) { razorDrops.splice(i, 1); continue; }
+    const heat = Math.min(1, p.life * 1.6);
+    c.fillStyle = `rgba(255,${Math.round(60 + heat * 170)},${Math.round(30 + heat * 130)},${p.life})`;
+    c.beginPath(); c.arc(p.x, p.y, 1 + heat * 1.6, 0, TAU); c.fill();
+  }
+  if (razorDrops.length > 220) razorDrops.splice(0, razorDrops.length - 220);
+
+  // ---- idle life: rising cauterised embers + treble sparkle
+  if (Math.random() < 0.3 + A.level * 0.4) razorDrops.push({
+    x: Math.random() * W, y: H + 2,
+    vx: (Math.random() - 0.5) * 0.6, vy: -(0.6 + Math.random() * 1.2 + A.bass),
+    life: 0.5 + Math.random() * 0.4,
+  });
+  const nt = Math.round(A.treble * 30);
+  for (let i = 0; i < nt; i++) {
+    c.fillStyle = `rgba(255,${Math.random() < 0.3 ? 220 : 40},40,${Math.random() * 0.4})`;
+    c.fillRect(Math.random() * W, Math.random() * H, 1.5, 1.5);
+  }
+
+  // ---- flash right on the slice
+  if (razorShear && razorShear.t > 0.5) {
+    c.fillStyle = `rgba(255,255,255,${(razorShear.t - 0.5) * 0.7})`;
+    c.fillRect(0, 0, W, H);
+  }
+
+  // ---- grime
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(0,0,0,0.14)';
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * 0.4, CX, CY, S);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.72)');
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   TUNOX BLOCK — MODES 40-49
+   Built for hard techno: dark, eerie, industrial cybersigilism, red on
+   black only (no hue cycling — these scenes ignore `hue` on purpose).
+   Every one is kick-led: A.beatHit is the event, A.bass the motor, and
+   nothing here idles prettily — it waits, then hits.
+   The wordmark is painted into the scene itself, so a capture or an
+   offline export carries the branding without the DOM overlay.
+   ===================================================================== */
+
+// --- shared TUNOX wordmark -------------------------------------------
+// Manual per-character tracking (canvas letterSpacing isn't safe to rely
+// on) so the name reads as a stamped mark, not a text label. Options:
+// fill / stroke / lw / glow / blur / alpha / jitter / track / scaleY.
+function tunoxWidth(c, txt, track) {
+  let w = 0;
+  for (const ch of txt) w += c.measureText(ch).width + track;
+  return w - track;
+}
+function drawTunox(c, x, y, size, o = {}) {
+  const txt = o.text || 'TUNOX';
+  const track = o.track != null ? o.track : size * 0.22;
+  const sy = o.scaleY || 1;
+  c.save();
+  c.font = `900 ${size}px "Arial Black", Impact, "Space Grotesk", system-ui, sans-serif`;
+  c.textAlign = 'left'; c.textBaseline = 'middle';
+  c.globalAlpha = o.alpha != null ? o.alpha : 1;
+  const lw = o.lw != null ? o.lw : Math.max(1, size * 0.05);
+  let px = x - tunoxWidth(c, txt, track) / 2;
+  for (const ch of txt) {
+    const cw = c.measureText(ch).width;
+    const jx = o.jitter ? (Math.random() - 0.5) * o.jitter : 0;
+    const jy = o.jitter ? (Math.random() - 0.5) * o.jitter : 0;
+    c.save();
+    c.translate(px + jx, y + jy);
+    if (sy !== 1) c.scale(1, sy);
+    // 1) glow cast off whichever pass is the body of the mark
+    if (o.glow) {
+      c.shadowColor = o.glow; c.shadowBlur = o.blur != null ? o.blur : size * 0.55;
+      if (o.fill) { c.fillStyle = o.fill; c.fillText(ch, 0, 0); }
+      else if (o.stroke) { c.lineWidth = lw; c.strokeStyle = o.stroke; c.strokeText(ch, 0, 0); }
+      c.shadowBlur = 0;
+    }
+    // 2) solid passes
+    if (o.fill) { c.fillStyle = o.fill; c.fillText(ch, 0, 0); }
+    if (o.stroke) { c.lineJoin = 'round'; c.miterLimit = 2; c.lineWidth = lw; c.strokeStyle = o.stroke; c.strokeText(ch, 0, 0); }
+    c.restore();
+    px += cw + track;
+  }
+  c.restore();
+}
+
+// scanlines + vignette — the common filth pass this block ends on
+function grime(c, S, lineA, vigInner, vigA) {
+  c.globalCompositeOperation = 'source-over';
+  c.globalAlpha = 1;
+  c.fillStyle = `rgba(0,0,0,${lineA})`;
+  for (let y = frame % 4; y < H; y += 4) c.fillRect(0, y, W, 1);
+  const vg = c.createRadialGradient(CX, CY, S * vigInner, CX, CY, S * 0.98);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, `rgba(0,0,0,${vigA})`);
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+}
+
+/* =====================================================================
+   MODE 40 — SIGIL  (cybersigil glyph: barbed, symmetric, self-rewriting)
+   A bilaterally symmetric cyber-sigil hangs in the void — curved spines
+   off a hot core, each hung with thorns and ending in a hook, bound by
+   broken containment arcs. It breathes on the bass and rewrites itself
+   into a whole new glyph on the hardest kicks. TUNOX sits under it like
+   a maker's mark burned into the plate.
+   ===================================================================== */
+function buildSigil() {
+  const arms = [];
+  const n = 3 + (Math.random() * 3 | 0);                 // arms per side
+  for (let i = 0; i < n; i++) {
+    const barbs = [];
+    const nb = 2 + (Math.random() * 4 | 0);
+    for (let k = 0; k < nb; k++) barbs.push({
+      t: 0.18 + Math.random() * 0.68,
+      len: 0.10 + Math.random() * 0.26,
+      side: Math.random() < 0.5 ? 1 : -1,
+      curl: 0.4 + Math.random() * 1.5,
+    });
+    arms.push({
+      a: -1.25 + ((i + 0.5) / n) * 2.5 + (Math.random() - 0.5) * 0.3,
+      len: 0.5 + Math.random() * 0.5,
+      bend: (Math.random() - 0.5) * 0.95,
+      hook: (Math.random() < 0.5 ? 1 : -1) * (0.25 + Math.random() * 0.5),
+      barbs,
+    });
+  }
+  const rings = [];                                       // broken containment arcs
+  const nr = 1 + (Math.random() * 3 | 0);
+  for (let i = 0; i < nr; i++) rings.push({
+    r: 0.32 + Math.random() * 0.6,
+    a0: Math.random() * TAU,
+    span: 0.6 + Math.random() * 2.4,
+    w: 0.003 + Math.random() * 0.007,
+  });
+  return { arms, rings };
+}
+function strokeSigilArm(c, arm, R) {
+  const ex = Math.cos(arm.a) * arm.len * R, ey = Math.sin(arm.a) * arm.len * R;
+  const nx = -Math.sin(arm.a), ny = Math.cos(arm.a);
+  const bx = ex * 0.5 + nx * arm.bend * R * 0.38, by = ey * 0.5 + ny * arm.bend * R * 0.38;
+  // point + tangent on the quadratic spine (P0 is the core, at 0,0)
+  const at = (t) => [2 * (1 - t) * t * bx + t * t * ex, 2 * (1 - t) * t * by + t * t * ey];
+  const tan = (t) => {
+    const dx = 2 * (1 - t) * bx + 2 * t * (ex - bx), dy = 2 * (1 - t) * by + 2 * t * (ey - by);
+    const m = Math.hypot(dx, dy) || 1; return [dx / m, dy / m];
+  };
+  // spine
+  c.beginPath(); c.moveTo(0, 0); c.quadraticCurveTo(bx, by, ex, ey); c.stroke();
+  // thorns hanging off it
+  for (const b of arm.barbs) {
+    const [px, py] = at(b.t), [tx, ty] = tan(b.t);
+    const a = Math.atan2(ty, tx) + b.side * (0.75 + b.curl * 0.22);
+    const L = b.len * R;
+    const tipX = px + Math.cos(a) * L, tipY = py + Math.sin(a) * L;
+    const ca = a - b.side * b.curl * 0.6;                 // curl back toward the spine
+    c.beginPath(); c.moveTo(px, py);
+    c.quadraticCurveTo(px + Math.cos(ca) * L * 0.6, py + Math.sin(ca) * L * 0.6, tipX, tipY);
+    c.stroke();
+  }
+  // terminal hook
+  const [tx, ty] = tan(1);
+  const hl = arm.len * R * 0.24;
+  const ha = Math.atan2(ty, tx) + arm.hook * 1.9;
+  c.beginPath(); c.moveTo(ex, ey);
+  c.quadraticCurveTo(ex + tx * hl, ey + ty * hl, ex + Math.cos(ha) * hl, ey + Math.sin(ha) * hl);
+  c.stroke();
+}
+function modeSigil(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(2,0,1,0.30)'; c.fillRect(0, 0, W, H);
+
+  if (!sigilGlyph) sigilGlyph = buildSigil();
+  if (A.beatHit && A.bass > 0.40 && Math.random() < 0.45) { sigilGlyph = buildSigil(); sigilFlash = 1; }
+  sigilFlash *= 0.87;
+  sigilRot += 0.0012 + A.mid * 0.0035;
+
+  const R = S * (0.30 + A.bass * 0.04 + A.beat * 0.022);
+  const heat = 0.35 + A.level * 0.4 + sigilFlash * 0.6;
+
+  // ---- dead red glow behind the glyph
+  c.globalCompositeOperation = 'lighter';
+  const bg = c.createRadialGradient(CX, CY, 0, CX, CY, S * 0.7);
+  bg.addColorStop(0, `rgba(120,6,8,${0.14 + A.bass * 0.26 + sigilFlash * 0.3})`);
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bg; c.beginPath(); c.arc(CX, CY, S * 0.7, 0, TAU); c.fill();
+
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  for (const mir of [1, -1]) {
+    c.save();
+    c.translate(CX, CY); c.rotate(sigilRot); c.scale(mir, 1);
+    // two passes: wide bleed, then the hot line
+    for (const [lwF, col] of [
+      [0.012, `rgba(255,14,10,${heat * 0.34})`],
+      [0.0032, `rgba(255,${Math.round(30 + sigilFlash * 200)},${Math.round(20 + sigilFlash * 180)},${0.55 + heat * 0.45})`],
+    ]) {
+      c.strokeStyle = col; c.lineWidth = Math.max(1, S * lwF);
+      for (const arm of sigilGlyph.arms) strokeSigilArm(c, arm, R);
+      for (const rg of sigilGlyph.rings) {
+        c.lineWidth = Math.max(1, S * lwF * (0.6 + rg.w * 60));
+        c.beginPath(); c.arc(0, 0, rg.r * R, rg.a0, rg.a0 + rg.span); c.stroke();
+      }
+    }
+    c.restore();
+  }
+
+  // ---- core: a hot slit that widens with the kick
+  const coreR = S * (0.018 + A.beat * 0.03);
+  const cg = c.createRadialGradient(CX, CY, 0, CX, CY, coreR * 4);
+  cg.addColorStop(0, `rgba(255,230,215,${0.5 + sigilFlash * 0.5})`);
+  cg.addColorStop(0.35, `rgba(255,40,20,${0.4 + A.bass * 0.4})`);
+  cg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = cg; c.beginPath(); c.arc(CX, CY, coreR * 4, 0, TAU); c.fill();
+
+  // ---- ash drifting up through the glyph
+  if (sigilAsh.length < 90 && Math.random() < 0.7) sigilAsh.push({
+    x: Math.random() * W, y: H + 4,
+    vx: (Math.random() - 0.5) * 0.5, vy: -(0.25 + Math.random() * 0.8),
+    r: 0.6 + Math.random() * 1.5, ph: Math.random() * TAU, life: 1,
+  });
+  for (let i = sigilAsh.length - 1; i >= 0; i--) {
+    const p = sigilAsh[i];
+    p.x += p.vx + Math.sin(frame * 0.01 + p.ph) * 0.3; p.y += p.vy; p.life -= 0.0035;
+    if (p.life <= 0 || p.y < -4) { sigilAsh.splice(i, 1); continue; }
+    c.fillStyle = `rgba(255,70,50,${p.life * 0.3})`;
+    c.fillRect(p.x, p.y, p.r, p.r);
+  }
+
+  // ---- the mark
+  c.globalCompositeOperation = 'lighter';
+  drawTunox(c, CX, CY + R * 1.28, S * 0.072, {
+    fill: `rgba(255,${Math.round(24 + sigilFlash * 120)},18,${0.72 + A.level * 0.28})`,
+    glow: 'rgba(255,20,15,0.9)', blur: S * 0.05,
+    track: S * 0.028, scaleY: 1.12,
+  });
+
+  if (sigilFlash > 0.45) { c.fillStyle = `rgba(255,40,30,${(sigilFlash - 0.45) * 0.5})`; c.fillRect(0, 0, W, H); }
+  grime(c, S, 0.15, 0.3, 0.86);
+}
+
+/* =====================================================================
+   MODE 41 — THORNS  (bramble closing in from the frame edge)
+   Barbed cyber-tribal vines crawl inward from all four sides, growing a
+   segment at a time and throwing thorns as they go. Every kick fires a
+   fresh run of growth; when the frame gets choked the oldest vines
+   blacken and fall away, so it breathes in and out with the track.
+   ===================================================================== */
+function spawnThorn(S) {
+  const edge = Math.random() * 4 | 0;
+  let x, y, a;
+  if (edge === 0) { x = Math.random() * W; y = -6; a = Math.PI / 2; }
+  else if (edge === 1) { x = W + 6; y = Math.random() * H; a = Math.PI; }
+  else if (edge === 2) { x = Math.random() * W; y = H + 6; a = -Math.PI / 2; }
+  else { x = -6; y = Math.random() * H; a = 0; }
+  return {
+    pts: [{ x, y }], a: a + (Math.random() - 0.5) * 0.7,
+    curl: (Math.random() - 0.5) * 0.16,
+    step: S * (0.022 + Math.random() * 0.03),
+    max: 14 + (Math.random() * 22 | 0),
+    barbs: [], heat: 1, age: 0,
+  };
+}
+function modeThorns(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(3,0,1,0.16)'; c.fillRect(0, 0, W, H);
+
+  // ---- red pressure behind everything, pumped by the kick
+  c.globalCompositeOperation = 'lighter';
+  const bg = c.createRadialGradient(CX, CY, 0, CX, CY, S * 0.8);
+  bg.addColorStop(0, `rgba(90,4,6,${0.16 + A.bass * 0.3 + A.beat * 0.2})`);
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bg; c.fillRect(0, 0, W, H);
+
+  // ---- kick = a new run of growth
+  if (A.beatHit) {
+    const n = 1 + Math.round(A.bass * 4);
+    for (let i = 0; i < n; i++) thornVines.push(spawnThorn(S));
+    thornFlash = 1;
+  }
+  thornFlash *= 0.86;
+  if (thornVines.length > 26) thornVines.splice(0, thornVines.length - 26);
+
+  // ---- grow: fast while loud, always creeping
+  const grow = Math.random() < 0.35 + A.level * 0.6;
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  for (let i = thornVines.length - 1; i >= 0; i--) {
+    const v = thornVines[i];
+    v.age++;
+    if (grow && v.pts.length < v.max) {
+      const p = v.pts[v.pts.length - 1];
+      v.a += v.curl + (Math.random() - 0.5) * 0.22;
+      const nx = p.x + Math.cos(v.a) * v.step, ny = p.y + Math.sin(v.a) * v.step;
+      v.pts.push({ x: nx, y: ny });
+      if (Math.random() < 0.65) {                         // throw a thorn off the new joint
+        const side = Math.random() < 0.5 ? 1 : -1;
+        const ba = v.a + side * (0.9 + Math.random() * 0.5);
+        const bl = v.step * (0.7 + Math.random() * 1.1);
+        v.barbs.push({ x: nx, y: ny, ba, bl, curl: side * (0.5 + Math.random()) });
+      }
+    }
+    if (v.pts.length >= v.max) v.heat *= 0.988;           // finished vines cool and blacken
+    if (v.heat < 0.08) { thornVines.splice(i, 1); continue; }
+
+    const h = v.heat, hot = Math.min(1, h * 1.3 + thornFlash * 0.4);
+    for (const [lwF, col] of [
+      [0.010, `rgba(255,12,8,${h * 0.26})`],
+      [0.0030, `rgba(255,${Math.round(18 + hot * 90)},${Math.round(12 + hot * 60)},${0.45 + h * 0.55})`],
+    ]) {
+      c.strokeStyle = col; c.lineWidth = Math.max(1, S * lwF);
+      c.beginPath(); c.moveTo(v.pts[0].x, v.pts[0].y);
+      for (let k = 1; k < v.pts.length; k++) c.lineTo(v.pts[k].x, v.pts[k].y);
+      c.stroke();
+      // every thorn on this vine is one colour — batch them as subpaths of a
+      // single stroke rather than one stroke each (same picture, ~8x cheaper)
+      c.lineWidth = Math.max(1, S * lwF * 0.65);
+      c.beginPath();
+      for (const b of v.barbs) {                          // curled thorns
+        c.moveTo(b.x, b.y);
+        c.quadraticCurveTo(
+          b.x + Math.cos(b.ba - b.curl * 0.5) * b.bl * 0.6, b.y + Math.sin(b.ba - b.curl * 0.5) * b.bl * 0.6,
+          b.x + Math.cos(b.ba) * b.bl, b.y + Math.sin(b.ba) * b.bl);
+      }
+      c.stroke();
+    }
+    // wet tip while it's still growing
+    if (v.pts.length < v.max) {
+      const t = v.pts[v.pts.length - 1];
+      c.fillStyle = `rgba(255,${Math.round(120 + hot * 120)},90,${0.5 + hot * 0.5})`;
+      c.beginPath(); c.arc(t.x, t.y, S * 0.004, 0, TAU); c.fill();
+    }
+  }
+
+  // ---- the mark, choked by the growth
+  drawTunox(c, CX, CY, S * 0.13, {
+    fill: `rgba(${Math.round(140 + thornFlash * 115)},${Math.round(8 + thornFlash * 40)},10,${0.5 + A.level * 0.4})`,
+    glow: 'rgba(255,15,10,0.85)', blur: S * 0.07,
+    track: S * 0.034, scaleY: 1.15,
+  });
+
+  grime(c, S, 0.16, 0.28, 0.88);
+}
+
+/* =====================================================================
+   MODE 42 — CRUCIBLE  (foundry pour — molten metal into the dark)
+   A ladle tips out of frame and pours white-hot metal into a pool that
+   lights the room from below. Bass opens the flow, the kick slams the
+   ladle and throws a full splash. Smoke rolls up the frame; TUNOX is
+   stencilled on the back wall, only visible when the pour lights it.
+   ===================================================================== */
+function modeCrucible(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#020001'; c.fillRect(0, 0, W, H);
+
+  const poolY = H * 0.86;
+  if (A.beatHit) { cruPour = 1; cruShake = 1; }
+  cruPour = Math.max(A.bass * 0.7, cruPour * 0.93);
+  cruShake *= 0.84;
+
+  const sx = (Math.random() - 0.5) * cruShake * S * 0.01;
+  const spoutX = CX + Math.sin(frame * 0.006) * W * 0.04 + sx;
+
+  // ---- wall wash from the pool, and the stencilled mark it reveals
+  c.globalCompositeOperation = 'lighter';
+  const wash = c.createRadialGradient(spoutX, poolY, 0, spoutX, poolY, S * 1.05);
+  wash.addColorStop(0, `rgba(190,40,10,${0.25 + cruPour * 0.4})`);
+  wash.addColorStop(0.4, `rgba(110,12,6,${0.12 + cruPour * 0.16})`);
+  wash.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = wash; c.fillRect(0, 0, W, H);
+
+  c.globalCompositeOperation = 'source-over';
+  drawTunox(c, CX, H * 0.34, S * 0.15, {                  // painted on the wall, lit by the pour
+    fill: `rgba(${Math.round(60 + cruPour * 120)},${Math.round(12 + cruPour * 26)},10,${0.30 + cruPour * 0.45})`,
+    stroke: `rgba(${Math.round(90 + cruPour * 140)},20,14,${0.2 + cruPour * 0.4})`,
+    lw: Math.max(1, S * 0.004), track: S * 0.04, scaleY: 1.1,
+  });
+
+  // ---- the stream: a wobbling ribbon of molten metal.
+  // kept narrow so it reads as a pour, not a bar of light
+  c.globalCompositeOperation = 'lighter';
+  const wTop = S * (0.006 + cruPour * 0.012);
+  for (const [wf, col] of [
+    [3.2, `rgba(255,50,10,${0.16 + cruPour * 0.2})`],
+    [1.0, `rgba(255,${Math.round(150 + cruPour * 90)},${Math.round(70 + cruPour * 140)},${0.8})`],
+  ]) {
+    c.beginPath();
+    for (const side of [1, -1]) {
+      const pts = [];
+      for (let y = 0; y <= poolY; y += S * 0.02) {
+        const t = y / poolY;
+        // it necks down and snakes as it falls, the way a real pour does
+        const wob = (Math.sin(y * 0.035 + frame * 0.16) + Math.sin(y * 0.011 - frame * 0.07) * 1.5) * S * 0.012 * t;
+        const w = wTop * wf * (1 - t * 0.55) * (1 + Math.sin(y * 0.06 + frame * 0.2) * 0.25);
+        pts.push([spoutX + wob + side * w, y]);
+      }
+      if (side === 1) { c.moveTo(pts[0][0], pts[0][1]); for (const p of pts) c.lineTo(p[0], p[1]); }
+      else { for (let i = pts.length - 1; i >= 0; i--) c.lineTo(pts[i][0], pts[i][1]); }
+    }
+    c.closePath(); c.fillStyle = col; c.fill();
+  }
+
+  // ---- splash off the pool surface
+  const burst = A.beatHit ? 20 + Math.round(A.bass * 40) : (Math.random() < 0.5 + A.level ? 2 : 0);
+  for (let k = 0; k < burst; k++) cruSplash.push({
+    x: spoutX + (Math.random() - 0.5) * S * 0.05, y: poolY,
+    vx: (Math.random() - 0.5) * 9 * (S / 600), vy: -(1 + Math.random() * 7) * (S / 600),
+    r: 1 + Math.random() * 2.4, life: 0.5 + Math.random() * 0.5,
+  });
+  for (let i = cruSplash.length - 1; i >= 0; i--) {
+    const p = cruSplash[i];
+    p.vy += 0.22; p.x += p.vx; p.y += p.vy; p.life -= 0.016;
+    if (p.life <= 0 || p.y > H) { cruSplash.splice(i, 1); continue; }
+    const heat = Math.min(1, p.life * 1.8);
+    c.strokeStyle = `rgba(255,${Math.round(80 + heat * 170)},${Math.round(20 + heat * 160)},${p.life})`;
+    c.lineWidth = p.r;
+    c.beginPath(); c.moveTo(p.x - p.vx, p.y - p.vy); c.lineTo(p.x, p.y); c.stroke();
+  }
+  if (cruSplash.length > 340) cruSplash.splice(0, cruSplash.length - 340);
+
+  // ---- the pool: a hot lens that swells on impact
+  const pr = S * (0.18 + cruPour * 0.12);
+  const pg = c.createRadialGradient(spoutX, poolY, 0, spoutX, poolY, pr);
+  pg.addColorStop(0, `rgba(255,240,225,${0.7 + cruPour * 0.3})`);
+  pg.addColorStop(0.22, `rgba(255,130,40,${0.6 + cruPour * 0.4})`);
+  pg.addColorStop(0.6, `rgba(220,40,10,${0.3 + cruPour * 0.3})`);
+  pg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = pg;
+  c.save(); c.translate(spoutX, poolY); c.scale(1.9, 0.4);
+  c.beginPath(); c.arc(0, 0, pr, 0, TAU); c.fill(); c.restore();
+  // cooling skin: thin dark arcs riding the surface, not blobs sitting on it
+  c.globalCompositeOperation = 'source-over';
+  c.strokeStyle = 'rgba(10,2,2,0.4)';
+  c.lineWidth = Math.max(1, S * 0.004);
+  for (let i = 0; i < 5; i++) {
+    const rr = pr * (0.35 + i * 0.16);
+    c.save(); c.translate(spoutX, poolY); c.scale(1.9, 0.4);
+    c.beginPath();
+    c.arc(0, 0, rr, 0.4 + i * 1.3 + frame * 0.003, 2.1 + i * 1.3 + frame * 0.003);
+    c.restore(); c.stroke();
+  }
+
+  // ---- smoke rolling up out of the pour
+  if (Math.random() < 0.5 + A.level * 0.5) cruSmoke.push({
+    x: spoutX + (Math.random() - 0.5) * S * 0.2, y: poolY - S * 0.02,
+    vx: (Math.random() - 0.5) * 0.6, vy: -(0.5 + Math.random() * 1.4),
+    r: S * (0.02 + Math.random() * 0.05), life: 1,
+  });
+  c.globalCompositeOperation = 'source-over';
+  for (let i = cruSmoke.length - 1; i >= 0; i--) {
+    const p = cruSmoke[i];
+    p.x += p.vx; p.y += p.vy; p.r *= 1.012; p.life -= 0.006;
+    if (p.life <= 0) { cruSmoke.splice(i, 1); continue; }
+    const lit = Math.max(0, 1 - (poolY - p.y) / (S * 0.7));
+    const g = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+    g.addColorStop(0, `rgba(${Math.round(30 + lit * 90)},${Math.round(8 + lit * 16)},8,${p.life * 0.3})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(p.x, p.y, p.r, 0, TAU); c.fill();
+  }
+  if (cruSmoke.length > 90) cruSmoke.splice(0, cruSmoke.length - 90);
+
+  grime(c, S, 0.14, 0.34, 0.8);
+}
+
+/* =====================================================================
+   MODE 43 — HOOKS  (chains and meat-hooks in a cold room)
+   Rows of chains hang from the dark, swinging on a pendulum the bass
+   drives. Behind them a red lamp; every kick fires a hard backlight
+   that throws the whole rig into flat silhouette for a frame or two.
+   Nothing moves fast — it just sways, and that's the unpleasant part.
+   ===================================================================== */
+function modeHooks(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#010001'; c.fillRect(0, 0, W, H);
+
+  if (hookRows.length !== 9 || hookW !== W) {
+    hookW = W; hookRows = [];
+    for (let i = 0; i < 9; i++) hookRows.push({
+      x: (i + 0.5) / 9, len: 0.34 + Math.random() * 0.4,
+      ph: Math.random() * TAU, amp: 0.4 + Math.random() * 0.8,
+      links: 10 + (Math.random() * 8 | 0),
+    });
+  }
+
+  if (A.beatHit) hookFlash = 1;
+  hookFlash *= 0.72;
+  hookSwing += 0.008 + A.bass * 0.02;
+
+  // ---- lamp behind the rig. It has to stay genuinely bright even between
+  // kicks, because everything in front of it is a black silhouette — dim the
+  // lamp and the whole scene reads as an empty frame.
+  c.globalCompositeOperation = 'lighter';
+  const lampY = H * 0.34;
+  const lg = c.createRadialGradient(CX, lampY, 0, CX, lampY, S * 0.8);
+  lg.addColorStop(0, `rgba(255,${Math.round(60 + hookFlash * 90)},40,${0.55 + A.bass * 0.3 + hookFlash * 0.45})`);
+  lg.addColorStop(0.25, `rgba(210,25,14,${0.34 + A.bass * 0.26 + hookFlash * 0.4})`);
+  lg.addColorStop(0.6, `rgba(90,6,6,${0.14 + hookFlash * 0.22})`);
+  lg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = lg; c.fillRect(0, 0, W, H);
+
+  // ---- the mark burned onto the far wall, thrown into relief by the lamp
+  c.globalCompositeOperation = 'source-over';
+  drawTunox(c, CX, lampY, S * 0.17, {
+    fill: 'rgba(3,0,0,0.9)',
+    stroke: `rgba(255,${Math.round(70 + hookFlash * 120)},40,${0.5 + hookFlash * 0.5})`,
+    lw: Math.max(1.5, S * 0.005), track: S * 0.045, scaleY: 1.2,
+  });
+
+  // ---- chains: black silhouette, thin red rim from the lamp side
+  for (const r of hookRows) {
+    const bx = r.x * W;
+    const sw = Math.sin(hookSwing * r.amp + r.ph) * (0.05 + A.bass * 0.06);
+    const topY = -S * 0.02, botY = topY + H * r.len;
+    const linkH = (botY - topY) / r.links;
+    for (let k = 0; k < r.links; k++) {
+      const t = k / r.links;
+      const x = bx + Math.sin(sw * 3 + t * 1.2) * W * 0.05 * t;
+      const y = topY + k * linkH;
+      const rw = S * 0.009 * (k % 2 ? 0.55 : 1);
+      c.fillStyle = '#000';
+      c.beginPath(); c.ellipse(x, y + linkH / 2, rw, linkH * 0.62, 0, 0, TAU); c.fill();
+      c.strokeStyle = `rgba(255,${Math.round(50 + hookFlash * 90)},30,${0.42 + hookFlash * 0.5})`;
+      c.lineWidth = Math.max(1.2, S * 0.0022);
+      c.beginPath(); c.ellipse(x, y + linkH / 2, rw, linkH * 0.62, 0, 0, TAU); c.stroke();
+    }
+    // the hook itself
+    const t = 1;
+    const hx = bx + Math.sin(sw * 3 + t * 1.2) * W * 0.05, hy = botY;
+    const hr = S * 0.035;
+    c.strokeStyle = '#000'; c.lineWidth = S * 0.012; c.lineCap = 'round';
+    c.beginPath(); c.moveTo(hx, hy); c.lineTo(hx, hy + hr * 0.5);
+    c.arc(hx - hr * 0.55, hy + hr * 0.5, hr * 0.55, 0, Math.PI * 1.25); c.stroke();
+    c.strokeStyle = `rgba(255,${Math.round(60 + hookFlash * 110)},35,${0.5 + hookFlash * 0.5})`;
+    c.lineWidth = Math.max(1.2, S * 0.0035);
+    c.beginPath(); c.moveTo(hx, hy); c.lineTo(hx, hy + hr * 0.5);
+    c.arc(hx - hr * 0.55, hy + hr * 0.5, hr * 0.55, 0, Math.PI * 1.25); c.stroke();
+  }
+
+  // ---- cold floor haze
+  c.globalCompositeOperation = 'lighter';
+  const fh = c.createLinearGradient(0, H * 0.72, 0, H);
+  fh.addColorStop(0, 'rgba(0,0,0,0)');
+  fh.addColorStop(1, `rgba(70,5,6,${0.14 + A.bass * 0.14 + hookFlash * 0.2})`);
+  c.fillStyle = fh; c.fillRect(0, H * 0.72, W, H * 0.28);
+
+  if (hookFlash > 0.6) { c.fillStyle = `rgba(255,30,25,${(hookFlash - 0.6) * 0.35})`; c.fillRect(0, 0, W, H); }
+  grime(c, S, 0.17, 0.34, 0.78);
+}
+
+/* =====================================================================
+   MODE 44 — RITUAL  (summoning circle burned into the floor)
+   A sigil circle laid flat in perspective: counter-rotating rings of
+   glyph ticks around a barbed star, TUNOX set into the outer band. The
+   kick drives a column of red light straight up out of the centre and
+   sends a ring of ash out across the floor.
+   ===================================================================== */
+function modeRitual(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(1,0,1,0.30)'; c.fillRect(0, 0, W, H);
+
+  if (A.beatHit) { ritPulse = 1; ritRings.push({ r: 0.1, life: 1 }); if (ritRings.length > 6) ritRings.shift(); }
+  ritPulse *= 0.90;
+  ritRot += 0.0022 + A.mid * 0.006;
+
+  const flY = H * 0.70, R = S * 0.42, squash = 0.32;
+
+  // ---- the light column, before the floor so the floor sits on top of it
+  c.globalCompositeOperation = 'lighter';
+  const colH = S * (0.5 + A.bass * 0.5 + ritPulse * 0.6);
+  const cw = S * (0.05 + ritPulse * 0.06);
+  const colG = c.createLinearGradient(0, flY - colH, 0, flY);
+  colG.addColorStop(0, 'rgba(0,0,0,0)');
+  colG.addColorStop(1, `rgba(255,25,18,${0.16 + A.bass * 0.25 + ritPulse * 0.4})`);
+  c.fillStyle = colG;
+  c.beginPath();
+  c.moveTo(CX - cw * 0.35, flY - colH); c.lineTo(CX + cw * 0.35, flY - colH);
+  c.lineTo(CX + cw, flY); c.lineTo(CX - cw, flY);
+  c.closePath(); c.fill();
+
+  c.save();
+  c.translate(CX, flY); c.scale(1, squash);
+
+  // ---- floor glow
+  const fg = c.createRadialGradient(0, 0, 0, 0, 0, R * 1.5);
+  fg.addColorStop(0, `rgba(150,10,8,${0.2 + A.bass * 0.28 + ritPulse * 0.3})`);
+  fg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = fg; c.beginPath(); c.arc(0, 0, R * 1.5, 0, TAU); c.fill();
+
+  const hot = 0.4 + A.level * 0.35 + ritPulse * 0.5;
+  c.lineCap = 'round';
+
+  // ---- shock rings racing outward on each kick
+  for (let i = ritRings.length - 1; i >= 0; i--) {
+    const rr = ritRings[i];
+    rr.r += 0.03 + A.bass * 0.02; rr.life -= 0.016;
+    if (rr.life <= 0 || rr.r > 1.6) { ritRings.splice(i, 1); continue; }
+    c.strokeStyle = `rgba(255,40,25,${rr.life * 0.5})`;
+    c.lineWidth = Math.max(1, S * 0.006 * rr.life);
+    c.beginPath(); c.arc(0, 0, rr.r * R, 0, TAU); c.stroke();
+  }
+
+  // ---- three bands of glyph ticks, counter-rotating
+  for (const [rf, dir, n, tick] of [[1.0, 1, 64, 0.055], [0.82, -1, 40, 0.08], [0.5, 1, 24, 0.11]]) {
+    const rad = R * rf;
+    c.strokeStyle = `rgba(255,18,12,${hot * 0.75})`;
+    c.lineWidth = Math.max(1, S * 0.0025);
+    c.beginPath(); c.arc(0, 0, rad, 0, TAU); c.stroke();
+    for (let i = 0; i < n; i++) {
+      const a = i / n * TAU + ritRot * dir * (1 + rf);
+      const f = freq[Math.floor(i / n * freq.length * 0.55)] / 255;
+      const L = rad * tick * (0.5 + f * 1.6);
+      c.strokeStyle = `rgba(255,${Math.round(20 + f * 180)},${Math.round(14 + f * 120)},${0.35 + f * 0.65})`;
+      c.lineWidth = Math.max(1, S * 0.003);
+      c.beginPath();
+      c.moveTo(Math.cos(a) * rad, Math.sin(a) * rad);
+      c.lineTo(Math.cos(a) * (rad + L), Math.sin(a) * (rad + L));
+      c.stroke();
+    }
+  }
+
+  // ---- barbed star in the middle
+  const pts = 7;
+  c.strokeStyle = `rgba(255,${Math.round(30 + ritPulse * 170)},20,${0.5 + hot * 0.5})`;
+  c.lineWidth = Math.max(1, S * 0.004);
+  c.beginPath();
+  for (let i = 0; i <= pts; i++) {
+    const a = (i * 3) / pts * TAU - ritRot * 0.6;         // {7/3} star polygon
+    const x = Math.cos(a) * R * 0.46, y = Math.sin(a) * R * 0.46;
+    i ? c.lineTo(x, y) : c.moveTo(x, y);
+  }
+  c.closePath(); c.stroke();
+  c.restore();
+
+  // ---- the mark, sitting in the outer band (drawn unsquashed so it reads)
+  c.globalCompositeOperation = 'lighter';
+  drawTunox(c, CX, flY + R * squash * 1.55, S * 0.085, {
+    fill: `rgba(255,${Math.round(26 + ritPulse * 120)},18,${0.68 + A.level * 0.32})`,
+    glow: 'rgba(255,20,12,0.9)', blur: S * 0.055,
+    track: S * 0.03, scaleY: 1.1,
+  });
+
+  // ---- ash lifted by the column
+  if (ritMotes.length < 110 && Math.random() < 0.8) ritMotes.push({
+    x: CX + (Math.random() - 0.5) * R * 1.6, y: flY + (Math.random() - 0.5) * R * squash,
+    vx: (Math.random() - 0.5) * 0.5, vy: -(0.2 + Math.random() * 1.1),
+    r: 0.6 + Math.random() * 1.6, life: 1,
+  });
+  for (let i = ritMotes.length - 1; i >= 0; i--) {
+    const p = ritMotes[i];
+    p.x += p.vx + Math.sin(frame * 0.012 + p.y * 0.01) * 0.3;
+    p.y += p.vy - ritPulse * 1.5; p.life -= 0.005;
+    if (p.life <= 0 || p.y < 0) { ritMotes.splice(i, 1); continue; }
+    c.fillStyle = `rgba(255,${Math.round(60 + p.life * 60)},45,${p.life * 0.35})`;
+    c.fillRect(p.x, p.y, p.r, p.r);
+  }
+
+  grime(c, S, 0.15, 0.3, 0.86);
+}
+
+/* =====================================================================
+   MODE 45 — VEIN  (biomechanical vascular net under the skin)
+   A branching vessel network grown out from the centre and left there,
+   dark and inert, until pulses of hot blood get pushed along it on the
+   kick and race out to the extremities. Grows a new body occasionally
+   so it never settles into a pattern you can memorise.
+   ===================================================================== */
+function buildVeins() {
+  const S = Math.min(W, H);
+  const segs = [], routes = [];
+  const grow = (x, y, a, len, depth, path) => {
+    const nx = x + Math.cos(a) * len, ny = y + Math.sin(a) * len;
+    segs.push({ x0: x, y0: y, x1: nx, y1: ny, w: 0.5 + depth * 0.9 });
+    const p = path.concat([{ x: nx, y: ny }]);
+    if (depth <= 1 || len < S * 0.015) { routes.push(p); return; }
+    const n = Math.random() < 0.25 ? 3 : 2;
+    for (let i = 0; i < n; i++) {
+      const spread = (i - (n - 1) / 2) * (0.5 + Math.random() * 0.45);
+      grow(nx, ny, a + spread + (Math.random() - 0.5) * 0.3, len * (0.66 + Math.random() * 0.22), depth - 1, p);
+    }
+  };
+  const roots = 5 + (Math.random() * 3 | 0);
+  for (let i = 0; i < roots; i++) grow(CX, CY, i / roots * TAU + Math.random() * 0.5, S * 0.14, 5, [{ x: CX, y: CY }]);
+  return { segs, routes };
+}
+function modeVein(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#030001'; c.fillRect(0, 0, W, H);
+
+  if (!veinNet || veinW !== W || veinH !== H) { veinNet = buildVeins(); veinW = W; veinH = H; }
+  if (A.beatHit && A.bass > 0.5 && Math.random() < 0.07) veinNet = buildVeins();
+
+  // ---- dull organ glow
+  c.globalCompositeOperation = 'lighter';
+  const bg = c.createRadialGradient(CX, CY, 0, CX, CY, S * 0.75);
+  bg.addColorStop(0, `rgba(80,4,8,${0.16 + A.bass * 0.3 + A.beat * 0.2})`);
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bg; c.beginPath(); c.arc(CX, CY, S * 0.75, 0, TAU); c.fill();
+
+  // ---- the vessels themselves — dark, wet, barely there
+  const throb = 1 + A.bass * 0.3 + A.beat * 0.2;
+  c.lineCap = 'round';
+  c.strokeStyle = `rgba(90,8,12,${0.35 + A.level * 0.3})`;
+  for (const s of veinNet.segs) {
+    c.lineWidth = s.w * throb * (S / 900);
+    c.beginPath(); c.moveTo(s.x0, s.y0); c.lineTo(s.x1, s.y1); c.stroke();
+  }
+
+  // ---- kick pushes blood out from the heart
+  if (A.beatHit) {
+    const n = 3 + Math.round(A.bass * 9);
+    for (let i = 0; i < n; i++) veinPulses.push({
+      route: veinNet.routes[(Math.random() * veinNet.routes.length) | 0],
+      t: 0, sp: 0.018 + Math.random() * 0.03 + A.bass * 0.02, life: 1,
+    });
+    if (veinPulses.length > 160) veinPulses.splice(0, veinPulses.length - 160);
+  }
+  for (let i = veinPulses.length - 1; i >= 0; i--) {
+    const p = veinPulses[i];
+    p.t += p.sp * (0.6 + A.level); p.life -= 0.006;
+    if (p.t >= 1 || p.life <= 0 || !p.route) { veinPulses.splice(i, 1); continue; }
+    const r = p.route, seg = Math.min(r.length - 2, Math.floor(p.t * (r.length - 1)));
+    const ft = p.t * (r.length - 1) - seg;
+    const a = r[seg], b = r[seg + 1];
+    const x = a.x + (b.x - a.x) * ft, y = a.y + (b.y - a.y) * ft;
+    const heat = p.life * (1 - p.t * 0.35);
+    // trail back down the vessel it just came through
+    c.strokeStyle = `rgba(255,${Math.round(30 + heat * 70)},30,${heat * 0.5})`;
+    c.lineWidth = Math.max(1, S * 0.004 * heat);
+    c.beginPath(); c.moveTo(a.x, a.y); c.lineTo(x, y); c.stroke();
+    // the cell itself
+    const g = c.createRadialGradient(x, y, 0, x, y, S * 0.02 * heat + 2);
+    g.addColorStop(0, `rgba(255,${Math.round(140 + heat * 90)},${Math.round(110 + heat * 90)},${heat})`);
+    g.addColorStop(0.4, `rgba(255,30,20,${heat * 0.7})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(x, y, S * 0.02 * heat + 2, 0, TAU); c.fill();
+  }
+
+  // ---- heart at the origin
+  const hr = S * (0.02 + A.bass * 0.03 + A.beat * 0.025);
+  const hg = c.createRadialGradient(CX, CY, 0, CX, CY, hr * 3);
+  hg.addColorStop(0, `rgba(255,200,190,${0.35 + A.beat * 0.5})`);
+  hg.addColorStop(0.3, `rgba(255,25,18,${0.4 + A.bass * 0.4})`);
+  hg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = hg; c.beginPath(); c.arc(CX, CY, hr * 3, 0, TAU); c.fill();
+
+  // ---- the mark, read through the tissue
+  drawTunox(c, CX, CY, S * 0.12, {
+    fill: `rgba(255,20,16,${0.16 + A.beat * 0.3})`,
+    stroke: `rgba(255,60,45,${0.25 + A.level * 0.35})`,
+    glow: 'rgba(255,15,10,0.7)', blur: S * 0.06,
+    lw: Math.max(1, S * 0.0035), track: S * 0.036, scaleY: 1.14,
+  });
+
+  grime(c, S, 0.13, 0.3, 0.88);
+}
+
+/* =====================================================================
+   MODE 46 — CATHEDRAL  (industrial nave, backlit red)
+   A row of pointed arches recedes into the dark, blasted from behind by
+   a red furnace glow. The kick fires a hard strobe through the arcade
+   and the whole colonnade goes flat black against white for a frame.
+   Dust hangs in the light shafts. TUNOX sits in the apse like an altar.
+   ===================================================================== */
+function modeCathedral(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#010001'; c.fillRect(0, 0, W, H);
+
+  if (A.beatHit) cathFlash = 1;
+  cathFlash *= 0.75;
+  cathSway += 0.004 + A.mid * 0.008;
+
+  const vpY = H * 0.56;
+  const white = cathFlash > 0.72;
+
+  // ---- furnace behind the apse
+  c.globalCompositeOperation = 'lighter';
+  const fg = c.createRadialGradient(CX, vpY, 0, CX, vpY, S * 0.9);
+  const fi = 0.28 + A.bass * 0.35 + cathFlash * 0.6;
+  fg.addColorStop(0, white ? `rgba(255,235,230,${fi})` : `rgba(210,25,15,${fi})`);
+  fg.addColorStop(0.35, `rgba(120,8,8,${0.14 + A.bass * 0.2 + cathFlash * 0.3})`);
+  fg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = fg; c.fillRect(0, 0, W, H);
+
+  // ---- the mark in the apse, silhouetted by the furnace. Sized off the
+  // narrowest (furthest) bay opening so the near piers never crop it.
+  const bays = 7;
+  const farSc = 0.24;
+  const openW = 2 * W * farSc * (0.5 - 0.055);
+  const markFs = Math.min(openW * 0.19, S * 0.08);
+  c.globalCompositeOperation = 'source-over';
+  drawTunox(c, CX, vpY + S * 0.01, markFs, {
+    fill: 'rgba(4,0,0,0.85)',
+    stroke: `rgba(255,${Math.round(40 + cathFlash * 100)},25,${0.42 + cathFlash * 0.5})`,
+    lw: Math.max(1, S * 0.003), track: markFs * 0.16, scaleY: 1.16,
+  });
+
+  // ---- the arcade: bays receding toward the vanishing point.
+  // far (small) bays first so the near ones paint over them.
+  for (let i = 0; i < bays; i++) {
+    const k = i / bays;
+    const sc = farSc + Math.pow(k, 1.5) * 1.5;            // near bays are huge
+    const halfW = W * 0.5 * sc, colW = W * 0.055 * sc;
+    const springY = vpY - S * 0.16 * sc, baseY = vpY + S * 0.42 * sc;
+    // A lancet only reads if it rises well above its half-span — tie the two
+    // together rather than picking a fixed height, or it comes out a horseshoe.
+    const halfSpan = halfW - colW;
+    const rise = halfSpan * 1.25;
+    const apexY = springY - rise;
+    const sway = Math.sin(cathSway + i) * S * 0.004 * sc;
+    const cap = rise * 0.14;
+
+    c.fillStyle = '#000';
+    for (const side of [1, -1]) {
+      const inner = CX + side * halfSpan + sway;
+      const outer = CX + side * (halfW + colW) + sway;
+      const apex = CX + sway;
+      // pier
+      c.fillRect(Math.min(inner, outer), springY, Math.abs(outer - inner), baseY - springY);
+      // gothic shoulder — cubic so both tangents are controllable: leaves the
+      // pier vertically, arrives at the apex steeply so the two sides meet in
+      // a point instead of rolling over into a round arch.
+      c.beginPath();
+      c.moveTo(inner, springY);
+      c.bezierCurveTo(inner, springY - rise * 0.6, inner + (apex - inner) * 0.82, apexY + rise * 0.35, apex, apexY);
+      c.lineTo(apex, apexY - cap);
+      c.bezierCurveTo(outer + (apex - outer) * 0.82, apexY - cap + rise * 0.35, outer, springY - rise * 0.6, outer, springY);
+      c.closePath(); c.fill();
+    }
+    // hot rim on the arch edge
+    c.globalCompositeOperation = 'lighter';
+    c.strokeStyle = `rgba(255,${Math.round(20 + cathFlash * 90)},15,${(0.08 + A.bass * 0.16 + cathFlash * 0.4) * (0.4 + k)})`;
+    c.lineWidth = Math.max(1, S * 0.0025 * sc);
+    for (const side of [1, -1]) {
+      const inner = CX + side * halfSpan + sway, apex = CX + sway;
+      c.beginPath();
+      c.moveTo(inner, baseY); c.lineTo(inner, springY);
+      c.bezierCurveTo(inner, springY - rise * 0.6, inner + (apex - inner) * 0.82, apexY + rise * 0.35, apex, apexY);
+      c.stroke();
+    }
+    c.globalCompositeOperation = 'source-over';
+  }
+
+  // ---- floor, catching the glow
+  c.globalCompositeOperation = 'lighter';
+  const fl = c.createLinearGradient(0, vpY + S * 0.4, 0, H);
+  fl.addColorStop(0, `rgba(120,10,8,${0.16 + A.bass * 0.2 + cathFlash * 0.3})`);
+  fl.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = fl; c.fillRect(0, vpY + S * 0.4, W, H);
+
+  // ---- dust hanging in the shaft
+  if (cathDust.length < 120 && Math.random() < 0.7) cathDust.push({
+    x: CX + (Math.random() - 0.5) * W * 0.5, y: vpY + (Math.random() - 0.5) * S * 0.5,
+    vx: (Math.random() - 0.5) * 0.25, vy: (Math.random() - 0.5) * 0.2,
+    r: 0.5 + Math.random() * 1.4, ph: Math.random() * TAU, life: 1,
+  });
+  for (let i = cathDust.length - 1; i >= 0; i--) {
+    const p = cathDust[i];
+    p.x += p.vx + Math.sin(frame * 0.009 + p.ph) * 0.2; p.y += p.vy; p.life -= 0.0028;
+    if (p.life <= 0) { cathDust.splice(i, 1); continue; }
+    const lit = Math.max(0, 1 - Math.hypot(p.x - CX, p.y - vpY) / (S * 0.6));
+    c.fillStyle = `rgba(255,${Math.round(90 + cathFlash * 120)},70,${p.life * lit * (0.25 + cathFlash * 0.4)})`;
+    c.fillRect(p.x, p.y, p.r, p.r);
+  }
+
+  if (white) { c.fillStyle = `rgba(255,245,240,${(cathFlash - 0.72) * 0.55})`; c.fillRect(0, 0, W, H); }
+  grime(c, S, 0.16, 0.3, 0.88);
+}
+
+/* =====================================================================
+   MODE 47 — BARBWIRE  (razorwire lattice under tension)
+   Coils of razorwire run corner to corner, spinning on their own axis so
+   the blades catch the light. Bass winds them tighter; the kick snaps a
+   strand — a white flash down its length, sparks off the break, and the
+   coil recoils before it re-tensions.
+   ===================================================================== */
+function modeBarbwire(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(2,0,1,0.34)'; c.fillRect(0, 0, W, H);
+
+  if (bwCoils.length !== 5) {
+    bwCoils = [];
+    for (let i = 0; i < 5; i++) bwCoils.push({
+      y: (i + 0.5) / 5, tilt: (Math.random() - 0.5) * 0.5,
+      spin: Math.random() * TAU, dir: Math.random() < 0.5 ? 1 : -1,
+      turns: 5 + (Math.random() * 4 | 0), snap: 0,   // few enough that each loop reads
+    });
+  }
+
+  if (A.beatHit) {
+    const v = bwCoils[(Math.random() * bwCoils.length) | 0];
+    v.snap = 1; bwFlash = 1;
+    for (let k = 0; k < 22 + Math.round(A.bass * 30); k++) bwSparks.push({
+      x: W * (0.15 + Math.random() * 0.7), y: v.y * H + (Math.random() - 0.5) * S * 0.06,
+      vx: (Math.random() - 0.5) * 10 * (S / 600), vy: (Math.random() - 0.5) * 8 * (S / 600),
+      r: 1 + Math.random() * 2, life: 0.4 + Math.random() * 0.5,
+    });
+  }
+  bwFlash *= 0.84;
+
+  // ---- backlight
+  c.globalCompositeOperation = 'lighter';
+  const bg = c.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, 'rgba(0,0,0,0)');
+  bg.addColorStop(0.5, `rgba(110,6,8,${0.18 + A.bass * 0.28 + bwFlash * 0.3})`);
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bg; c.fillRect(0, 0, W, H);
+
+  // ---- the mark behind the wire
+  drawTunox(c, CX, CY, S * 0.15, {
+    fill: `rgba(${Math.round(90 + bwFlash * 120)},8,9,${0.3 + A.level * 0.3})`,
+    stroke: `rgba(255,${Math.round(40 + bwFlash * 90)},30,${0.35 + A.level * 0.3})`,
+    lw: Math.max(1, S * 0.003),
+    track: S * 0.04, scaleY: 1.18,
+  });
+
+  // ---- coils
+  c.lineCap = 'round';
+  for (const v of bwCoils) {
+    v.spin += v.dir * (0.006 + A.mid * 0.03);
+    v.snap *= 0.88;
+    const y0 = v.y * H + v.snap * (Math.random() - 0.5) * S * 0.05;
+    const amp = S * (0.055 + A.bass * 0.03) * (1 - v.snap * 0.4);
+    const hot = 0.3 + A.level * 0.3 + v.snap * 0.7 + bwFlash * 0.2;
+    const N = 150;
+    // Two strands a half-turn out of phase. A single sine reads as a waveform;
+    // the crossing pair reads as twisted wire seen side-on, which is the point.
+    for (const [lw, col] of [
+      [S * 0.008, `rgba(255,14,10,${hot * 0.3})`],
+      [Math.max(1, S * 0.0022), v.snap > 0.5
+        ? `rgba(255,${Math.round(200 * v.snap)},${Math.round(190 * v.snap)},${0.7 + v.snap * 0.3})`
+        : `rgba(${Math.round(180 + hot * 75)},${Math.round(30 + hot * 40)},28,${0.45 + hot * 0.5})`],
+    ]) {
+      c.strokeStyle = col; c.lineWidth = lw;
+      c.beginPath();
+      for (const off of [0, Math.PI]) {
+        for (let i = 0; i <= N; i++) {
+          const t = i / N, x = t * W;
+          const ph = t * v.turns * TAU + v.spin + off;
+          const y = y0 + Math.sin(ph) * amp + (t - 0.5) * v.tilt * H * 0.2;
+          i ? c.lineTo(x, y) : c.moveTo(x, y);
+        }
+      }
+      c.stroke();
+    }
+    // barbs clamped on where the strands cross. Solid metal, not additive —
+    // under 'lighter' they wash out to yellow against the red backlight.
+    c.globalCompositeOperation = 'source-over';
+    for (let k = 0; k < v.turns * 2; k++) {
+      const t = (k + 0.5) / (v.turns * 2), x = t * W;
+      const ph = t * v.turns * TAU + v.spin;
+      const y = y0 + Math.sin(ph) * amp + (t - 0.5) * v.tilt * H * 0.2;
+      const face = Math.abs(Math.cos(ph));                // edge-on vs. flat to the light
+      const bl = S * 0.024 * (0.5 + face);
+      c.save(); c.translate(x, y); c.rotate(ph * 0.5);
+      c.fillStyle = `rgba(${Math.round(120 + face * 120)},${Math.round(24 + face * 40 + v.snap * 180)},${Math.round(20 + face * 26)},${0.7 + face * 0.3})`;
+      c.beginPath();
+      c.moveTo(-bl, 0); c.lineTo(0, -bl * 0.3); c.lineTo(bl, 0); c.lineTo(0, bl * 0.3);
+      c.closePath(); c.fill();
+      c.restore();
+    }
+    c.globalCompositeOperation = 'lighter';   // sparks below glow again
+  }
+
+  // ---- sparks off the break
+  for (let i = bwSparks.length - 1; i >= 0; i--) {
+    const p = bwSparks[i];
+    p.vy += 0.2; p.x += p.vx; p.y += p.vy; p.life -= 0.02;
+    if (p.life <= 0 || p.y > H) { bwSparks.splice(i, 1); continue; }
+    const heat = Math.min(1, p.life * 1.8);
+    c.strokeStyle = `rgba(255,${Math.round(90 + heat * 160)},${Math.round(40 + heat * 150)},${p.life})`;
+    c.lineWidth = p.r;
+    c.beginPath(); c.moveTo(p.x - p.vx, p.y - p.vy); c.lineTo(p.x, p.y); c.stroke();
+  }
+  if (bwSparks.length > 300) bwSparks.splice(0, bwSparks.length - 300);
+
+  grime(c, S, 0.15, 0.32, 0.85);
+}
+
+/* =====================================================================
+   MODE 48 — RUST  (corroded bulkhead, stencilled and left to rot)
+   A riveted steel plate with TUNOX stencilled across it, eaten by
+   corrosion blooms. A red inspection lamp sweeps the surface; the kick
+   lands as a hammer blow that shocks the plate and shakes flakes loose.
+   The calmest scene here — it's for the long grinding stretches.
+   ===================================================================== */
+function modeRust(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#0a0605'; c.fillRect(0, 0, W, H);
+
+  if (rustBlooms.length !== 46 || rustW !== W) {
+    rustW = W; rustBlooms = [];
+    for (let i = 0; i < 46; i++) rustBlooms.push({
+      x: Math.random(), y: Math.random(),
+      r: 0.02 + Math.random() * 0.11, a: 0.1 + Math.random() * 0.3,
+    });
+  }
+  if (A.beatHit) { rustHit = 1; rustHitX = Math.random(); rustHitY = Math.random(); }
+  rustHit *= 0.86;
+  rustSweep += 0.003 + A.mid * 0.006;
+
+  const shk = rustHit * S * 0.006;
+  c.save();
+  c.translate((Math.random() - 0.5) * shk, (Math.random() - 0.5) * shk);
+
+  // ---- plate: panel seams and rivets
+  const panel = S * 0.36;
+  c.strokeStyle = 'rgba(0,0,0,0.75)'; c.lineWidth = Math.max(2, S * 0.005);
+  for (let x = panel; x < W; x += panel) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke(); }
+  for (let y = panel; y < H; y += panel) { c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke(); }
+  for (let x = panel * 0.5; x < W; x += panel) {
+    for (let y = panel * 0.28; y < H; y += panel * 0.22) {
+      c.fillStyle = 'rgba(0,0,0,0.5)';
+      c.beginPath(); c.arc(x, y, S * 0.005, 0, TAU); c.fill();
+      c.fillStyle = 'rgba(90,60,52,0.25)';
+      c.beginPath(); c.arc(x - S * 0.0012, y - S * 0.0012, S * 0.0034, 0, TAU); c.fill();
+    }
+  }
+
+  // ---- corrosion blooms eating the plate
+  for (const b of rustBlooms) {
+    const g = c.createRadialGradient(b.x * W, b.y * H, 0, b.x * W, b.y * H, b.r * S);
+    g.addColorStop(0, `rgba(96,34,12,${b.a})`);
+    g.addColorStop(0.6, `rgba(58,16,8,${b.a * 0.6})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(b.x * W, b.y * H, b.r * S, 0, TAU); c.fill();
+  }
+
+  // ---- the stencil, worn through
+  drawTunox(c, CX, CY, S * 0.2, {
+    fill: 'rgba(148,18,14,0.62)',
+    stroke: 'rgba(10,3,3,0.75)', lw: Math.max(2, S * 0.006),
+    track: S * 0.052, scaleY: 1.22,
+  });
+  // corrosion chewing back into the letterforms
+  c.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < 26; i++) {
+    const x = CX + (Math.random() - 0.5) * S * 0.95, y = CY + (Math.random() - 0.5) * S * 0.18;
+    c.fillStyle = `rgba(${20 + Math.random() * 40 | 0},${8 + Math.random() * 12 | 0},6,${0.1 + Math.random() * 0.3})`;
+    c.beginPath(); c.arc(x, y, S * (0.004 + Math.random() * 0.016), 0, TAU); c.fill();
+  }
+
+  // ---- inspection lamp crawling over the surface
+  c.globalCompositeOperation = 'lighter';
+  const lx = CX + Math.cos(rustSweep) * W * 0.42, ly = CY + Math.sin(rustSweep * 0.7) * H * 0.32;
+  const lamp = c.createRadialGradient(lx, ly, 0, lx, ly, S * 0.55);
+  lamp.addColorStop(0, `rgba(190,26,16,${0.2 + A.bass * 0.28})`);
+  lamp.addColorStop(0.5, `rgba(90,10,8,${0.08 + A.bass * 0.1})`);
+  lamp.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = lamp; c.fillRect(0, 0, W, H);
+
+  // ---- hammer blow: a bright ring on the plate + flakes shaken loose
+  if (rustHit > 0.05) {
+    const hx = rustHitX * W, hy = rustHitY * H;
+    const rr = S * (0.05 + (1 - rustHit) * 0.35);
+    c.strokeStyle = `rgba(255,${Math.round(80 + rustHit * 140)},60,${rustHit * 0.55})`;
+    c.lineWidth = Math.max(1, S * 0.008 * rustHit);
+    c.beginPath(); c.arc(hx, hy, rr, 0, TAU); c.stroke();
+    if (A.beatHit) for (let k = 0; k < 16 + Math.round(A.bass * 24); k++) rustFlakes.push({
+      x: hx + (Math.random() - 0.5) * S * 0.12, y: hy + (Math.random() - 0.5) * S * 0.12,
+      vx: (Math.random() - 0.5) * 2, vy: -Math.random() * 2,
+      a: Math.random() * TAU, va: (Math.random() - 0.5) * 0.3,
+      r: S * (0.002 + Math.random() * 0.005), life: 1,
+    });
+  }
+
+  // ---- flakes falling off
+  c.globalCompositeOperation = 'source-over';
+  for (let i = rustFlakes.length - 1; i >= 0; i--) {
+    const p = rustFlakes[i];
+    p.vy += 0.14; p.x += p.vx; p.y += p.vy; p.a += p.va; p.life -= 0.009;
+    if (p.life <= 0 || p.y > H + 8) { rustFlakes.splice(i, 1); continue; }
+    c.save(); c.translate(p.x, p.y); c.rotate(p.a);
+    c.fillStyle = `rgba(${110 + Math.random() * 40 | 0},42,18,${p.life * 0.8})`;
+    c.fillRect(-p.r, -p.r * 0.5, p.r * 2, p.r);
+    c.restore();
+  }
+  if (rustFlakes.length > 260) rustFlakes.splice(0, rustFlakes.length - 260);
+
+  c.restore();
+  grime(c, S, 0.13, 0.24, 0.9);
+}
+
+/* =====================================================================
+   MODE 49 — HEXCODE  (corrupted datastream with the sigil underneath)
+   Columns of hex and occult marks fall through the dark. Treble drives
+   the fall, the kick corrupts whole columns to white and tears the
+   frame sideways. Every so often the noise resolves and TUNOX locks in
+   across the middle of the stream before it dissolves again.
+   ===================================================================== */
+const HEX_GLYPHS = '0123456789ABCDEF†‡×÷¬√∆◊';
+function modeHexcode(c) {
+  const S = Math.min(W, H);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = 'rgba(1,0,1,0.20)'; c.fillRect(0, 0, W, H);
+
+  const fs = Math.max(10, S * 0.026);
+  const cols = Math.ceil(W / (fs * 0.78));
+  if (hexCols.length !== cols || hexW !== W) {
+    hexW = W; hexCols = [];
+    for (let i = 0; i < cols; i++) hexCols.push({
+      y: Math.random() * H, sp: 0.4 + Math.random() * 1.6,
+      len: 6 + (Math.random() * 18 | 0), corrupt: 0,
+    });
+  }
+
+  if (A.beatHit) {
+    hexTear = 1;
+    const n = 3 + Math.round(A.bass * 10);
+    for (let i = 0; i < n; i++) hexCols[(Math.random() * cols) | 0].corrupt = 1;
+    if (A.bass > 0.45 && Math.random() < 0.35) hexLock = 1;
+  }
+  hexTear *= 0.80;
+  hexLock *= 0.965;
+
+  // ---- horizontal tear: shove a band of the frame sideways
+  // source rect is in backing-store pixels, dest in logical units — derive the
+  // ratio from the canvas so this survives renderScale < 1 and offline export
+  if (hexTear > 0.1) {
+    const pr = c.canvas.width / W;
+    const bandY = (frame * 37 % H) | 0, bandH = S * 0.08 * hexTear;
+    const off = (Math.random() - 0.5) * W * 0.12 * hexTear;
+    c.drawImage(c.canvas, 0, bandY * pr, c.canvas.width, bandH * pr, off, bandY, W, bandH);
+  }
+
+  // ---- the stream
+  c.font = `${fs}px "Courier New", monospace`;
+  c.textAlign = 'left'; c.textBaseline = 'top';
+  const step = fs * 1.05;
+  for (let i = 0; i < cols; i++) {
+    const col = hexCols[i];
+    col.y += col.sp * (1.2 + A.treble * 7 + A.level * 3);
+    col.corrupt *= 0.9;
+    if (col.y > H + col.len * step) { col.y = -col.len * step; col.sp = 0.4 + Math.random() * 1.6; }
+    const x = i * fs * 0.78;
+    // only the head of the column is painted each frame — the low-alpha bg
+    // fade above smears it into the tail, same trick MATRIX uses
+    const drawn = Math.min(col.len, 6);
+    for (let k = 0; k < drawn; k++) {
+      const y = col.y - k * step;
+      if (y < -step || y > H) continue;
+      const g = HEX_GLYPHS[(Math.random() * HEX_GLYPHS.length) | 0];
+      const fade = 1 - k / drawn;     // falls off over the painted head; the bg fade takes it from there
+      if (k === 0) {                                       // hot leading character
+        c.fillStyle = `rgba(255,${Math.round(190 + col.corrupt * 65)},${Math.round(170 + col.corrupt * 85)},0.95)`;
+      } else if (col.corrupt > 0.3) {
+        c.fillStyle = `rgba(255,${Math.round(200 * col.corrupt)},${Math.round(190 * col.corrupt)},${fade})`;
+      } else {
+        c.fillStyle = `rgba(${Math.round(150 + fade * 105)},${Math.round(10 + fade * 24)},12,${fade * 0.85})`;
+      }
+      c.fillText(g, x, y);
+    }
+  }
+
+  // ---- the sigil bar the stream is running over
+  c.globalCompositeOperation = 'lighter';
+  const barY = CY, barH = S * 0.14;
+  const bg = c.createLinearGradient(0, barY - barH, 0, barY + barH);
+  bg.addColorStop(0, 'rgba(0,0,0,0)');
+  bg.addColorStop(0.5, `rgba(120,6,8,${0.12 + A.bass * 0.22 + hexLock * 0.35})`);
+  bg.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = bg; c.fillRect(0, barY - barH, W, barH * 2);
+
+  // ---- the name resolving out of the noise
+  const lock = Math.max(hexLock, 0.14 + A.level * 0.2);
+  drawTunox(c, CX, barY, S * 0.14, {
+    fill: `rgba(255,${Math.round(20 + hexLock * 170)},${Math.round(16 + hexLock * 150)},${0.35 + lock * 0.65})`,
+    glow: 'rgba(255,20,14,0.9)', blur: S * 0.06,
+    jitter: (1 - hexLock) * S * 0.012 + hexTear * S * 0.02,
+    track: S * 0.038, scaleY: 1.16,
+  });
+  // RGB-split ghosts while it's still unstable
+  if (hexLock < 0.75) {
+    const sp = (1 - hexLock) * S * 0.012;
+    for (const [dx, col] of [[-sp, 'rgba(255,0,0,0.30)'], [sp, 'rgba(120,0,255,0.16)']]) {
+      drawTunox(c, CX + dx, barY, S * 0.14, { fill: col, track: S * 0.038, scaleY: 1.16, alpha: 0.7 });
+    }
+  }
+
+  if (hexTear > 0.55) { c.fillStyle = `rgba(255,255,255,${(hexTear - 0.55) * 0.4})`; c.fillRect(0, 0, W, H); }
+  grime(c, S, 0.16, 0.3, 0.86);
+}
+
+/* =====================================================================
    RENDER LOOP  +  bloom composite
    ===================================================================== */
 const MODES = [
   modeAurora, modeSpectrum, modeTunnel, modeGalaxy, modeSynth, modeKaleido, modeLiquid, modeScope,
   modeTerrain, modeRings, modeRays, modeMatrix, modeLissajous, modeWeb, modeVortex, modePlasma,
   modeStrobe, modeLasers, modePillars, modeHypno, modeSiren, modeGlitch, modeCassette,
+  modeFireflies, modeJellyfish, modeHelix, modeRadar, modeSkyline, modeFireworks, modeInferno, modeOrbits,
+  modeBunker, modePress, modeBlackout, modeTesla, modeShaft,
+  modeMonolith, modeGrinder, modeSentinel, modeRazor,
+  modeSigil, modeThorns, modeCrucible, modeHooks, modeRitual,
+  modeVein, modeCathedral, modeBarbwire, modeRust, modeHexcode,
 ];
 const NAMES = [
   'AURORA', 'SPECTRUM', 'TUNNEL', 'GALAXY', 'SYNTHWAVE', 'KALEIDO', 'LIQUID', 'SCOPE',
   'TERRAIN', 'RINGS', 'RAYS', 'MATRIX', 'LISSAJOUS', 'WEB', 'VORTEX', 'PLASMA',
   'STROBE', 'LASERS', 'PILLARS', 'HYPNO', 'SIREN', 'GLITCH', 'CASSETTE',
+  'FIREFLIES', 'JELLYFISH', 'HELIX', 'RADAR', 'SKYLINE', 'FIREWORKS', 'INFERNO', 'ORBITS',
+  'BUNKER', 'PRESS', 'BLACKOUT', 'TESLA', 'SHAFT',
+  'MONOLITH', 'GRINDER', 'SENTINEL', 'RAZOR',
+  'SIGIL', 'THORNS', 'CRUCIBLE', 'HOOKS', 'RITUAL',
+  'VEIN', 'CATHEDRAL', 'BARBWIRE', 'RUST', 'HEXCODE',
 ];
 let mode = 0;
 let running = false;
@@ -2215,6 +5570,7 @@ function setMode(m) {
   if (m !== mode) startTransition();      // dissolve the outgoing scene into the new one
   mode = m;
   modeBadge.textContent = NAMES[m];
+  sceneBtnLabel.textContent = NAMES[m];
   [...modeSwitch.children].forEach((b, i) => b.classList.toggle('active', i === m));
   // hard clear so trails from previous mode don't linger
   sctx.clearRect(0, 0, W, H);
@@ -2234,11 +5590,11 @@ function setMode(m) {
      tracks the live preview's feel. It isn't frame-identical to a live pass
      — live uses the real-time AnalyserNode, export its own offline FFT.
    ===================================================================== */
-// the 23 scenes grouped by visual energy (indices into MODES / NAMES)
+// the 50 scenes grouped by visual energy (indices into MODES / NAMES)
 const SCENE_TIERS = {
-  calm:    [0, 3, 6, 8, 12, 19],                // Aurora Galaxy Liquid Terrain Lissajous Hypno
-  mid:     [1, 2, 4, 5, 7, 9, 13, 18, 20, 22],  // Spectrum Tunnel Synthwave Kaleido Scope Rings Web Pillars Siren Cassette
-  intense: [10, 11, 14, 15, 16, 17, 21],        // Rays Matrix Vortex Plasma Strobe Lasers Glitch
+  calm:    [0, 3, 6, 8, 12, 19, 23, 24, 30, 36, 48],        // Aurora Galaxy Liquid Terrain Lissajous Hypno Fireflies Jellyfish Orbits Monolith Rust
+  mid:     [1, 2, 4, 5, 7, 9, 13, 18, 20, 22, 25, 26, 27, 34, 38, 40, 43, 44, 45, 46],  // Spectrum Tunnel Synthwave Kaleido Scope Rings Web Pillars Siren Cassette Helix Radar Skyline Tesla Sentinel Sigil Hooks Ritual Vein Cathedral
+  intense: [10, 11, 14, 15, 16, 17, 21, 28, 29, 31, 32, 33, 35, 37, 39, 41, 42, 47, 49],  // Rays Matrix Vortex Plasma Strobe Lasers Glitch Fireworks Inferno Bunker Press Blackout Shaft Grinder Razor Thorns Crucible Barbwire Hexcode
 };
 
 function mulberry32(a) {
@@ -2431,7 +5787,7 @@ function composite(outCtx, outW, outH) {
 
 // strobes + fade in/out, drawn on top of everything
 function drawPost(c, w, h) {
-  const fa = fadeAlpha();
+  const fa = Math.max(fadeAlpha(), liveFadeAlpha());
   if (post.flashB > 0.01) { c.fillStyle = `rgba(0,0,0,${Math.min(1, post.flashB)})`; c.fillRect(0, 0, w, h); }
   if (post.flashW > 0.01) {
     c.globalCompositeOperation = 'lighter';
@@ -2511,14 +5867,22 @@ function drawFrameInto(outCtx, outW, outH) {
 function loop() {
   if (!running) return;
   requestAnimationFrame(loop);
-  frame++;
   const now = performance.now();
+  if (maxFps > 0 && lastFrameNow && (now - lastFrameNow) < (1000 / maxFps) - 1) return;   // frame-rate cap
+  frame++;
   dtSec = lastFrameNow ? Math.min(0.1, (now - lastFrameNow) / 1000) : 1 / 60;
   lastFrameNow = now;
   analyze();
   hue = (hue + 0.25 + A.treble * 1.5) % 360;
   renderTime = (audioEl && !isMic) ? audioEl.currentTime : 0;
   renderDur = (audioEl && !isMic && isFinite(audioEl.duration)) ? audioEl.duration : 0;
+  // live input has no song timeline — the scrubber becomes an elapsed-set clock
+  if (isMic) {
+    if (!liveStartMs) { liveStartMs = now; controls.classList.add('live'); }
+    curTime.textContent = fmt((now - liveStartMs) / 1000);
+  } else if (liveStartMs) {
+    liveStartMs = 0; controls.classList.remove('live');
+  }
   if (audioEl && !isMic) applyAutomation(audioEl.currentTime);
   // shuffle clock: song time for files (freezes on pause, stays deterministic for
   // export); wall-clock for live mic input, which has no song timeline
@@ -2666,6 +6030,7 @@ function encodeAudioBuffer(aenc, buffer, numCh, headSec = 0) {
 }
 
 function downloadBlob(blob, name) {
+  if (IN_PLUGIN && blob && blob.size <= 32 * 1024 * 1024) { pluginSaveBlob(blob, name); return; }  // small files → native save dialog
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 3000);
@@ -2881,29 +6246,51 @@ dropzone.addEventListener('drop', e => {
   else if (f) alert('Unsupported file. Drop an audio file (WAV, MP3, OGG, FLAC, M4A…).');
 });
 window.addEventListener('dragover', e => e.preventDefault());
-window.addEventListener('drop', e => e.preventDefault());
+window.addEventListener('drop', e => { e.preventDefault(); if (IN_PLUGIN) { const f = e.dataTransfer && e.dataTransfer.files[0]; if (isAudioFile(f)) loadFile(f); } });
 
 dropzone.querySelector('.drop-hint').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 loadBtn.addEventListener('click', () => fileInput.click());
-micBtn.addEventListener('click', () => useMic(inputDevice.value || undefined));
+srcBtn.addEventListener('click', openIntro);
+introClose.addEventListener('click', closeIntro);
+intro.addEventListener('click', e => { if (e.target === intro) closeIntro(); });   // click backdrop to dismiss
+micBtn.addEventListener('click', () => IN_PLUGIN ? useFLAudio() : useMic(inputDevice.value || undefined));
 sysBtn.addEventListener('click', useSystemAudio);
-mixMicBtn.addEventListener('click', () => useMic(inputDevice.value || undefined));
+mixMicBtn.addEventListener('click', () => IN_PLUGIN ? useFLAudio() : useMic(inputDevice.value || undefined));
 mixSysBtn.addEventListener('click', useSystemAudio);
 inputDevice.addEventListener('change', () => { if (isMic && inputDevice.value) useMic(inputDevice.value); });
 
-playBtn.addEventListener('click', toggle);
+playBtn.addEventListener('click', () => (IN_PLUGIN && pluginActive) ? hostTransport('toggle') : toggle());
 vol.addEventListener('input', () => { if (gain) gain.gain.value = vol.value / 100; });
 
-seek.addEventListener('input', () => { seeking = true; if (audioEl) curTime.textContent = fmt(seek.value / 1000 * audioEl.duration); });
+seek.addEventListener('input', () => { if (isMic) return; seeking = true; if (audioEl) curTime.textContent = fmt(seek.value / 1000 * audioEl.duration); });
 seek.addEventListener('change', () => {
+  if (isMic) return;
   if (audioEl && audioEl.duration) audioEl.currentTime = seek.value / 1000 * audioEl.duration;
   seeking = false;
 });
 
+// scene picker — options generated from NAMES so new scenes show up automatically
+modeSwitch.innerHTML = NAMES.map((n, i) =>
+  `<button data-mode="${i}" class="m${i ? '' : ' active'}" type="button" role="option"><span class="k">${i + 1}</span>${n}</button>`).join('');
+
+function openScenePop(open) {
+  modeSwitch.classList.toggle('hidden', !open);
+  sceneBtn.classList.toggle('open', open);
+  sceneBtn.setAttribute('aria-expanded', open);
+  if (open) modeSwitch.querySelector('.m.active')?.scrollIntoView({ block: 'nearest' });
+}
+sceneBtn.addEventListener('click', () => openScenePop(modeSwitch.classList.contains('hidden')));
+document.addEventListener('click', e => {
+  if (!modeSwitch.classList.contains('hidden') && !sceneSelect.contains(e.target)) openScenePop(false);
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !modeSwitch.classList.contains('hidden')) openScenePop(false);
+  else if (e.key === 'Escape' && started && !intro.classList.contains('hidden')) closeIntro();
+});
 modeSwitch.addEventListener('click', e => {
   const b = e.target.closest('button[data-mode]');
-  if (b) userSetMode(+b.dataset.mode);
+  if (b) { userSetMode(+b.dataset.mode); openScenePop(false); }
 });
 
 shuffleBtn.addEventListener('click', toggleShuffle);
@@ -2990,6 +6377,12 @@ ovList.addEventListener('change', e => {
   const row = e.target.closest('.ov-row');
   if (row && e.target.classList.contains('ov-mode')) setOverlayMode(row.dataset.id, e.target.value);
 });
+// reaching for a clip is intent — jump it to the front of the warm queue so
+// it's decoded by the time the click lands
+ovList.addEventListener('pointerover', e => {
+  const row = e.target.closest('.ov-row');
+  if (row) queueWarm(row.dataset.id, true);
+});
 ovBlend.addEventListener('click', e => { const b = e.target.closest('button'); if (b) { segPick(ovBlend, b); overlays.blend = b.dataset.b; } });
 ovFit.addEventListener('click', e => { const b = e.target.closest('button'); if (b) { segPick(ovFit, b); overlays.fit = b.dataset.f; } });
 ovOpacity.addEventListener('input', () => { overlays.opacity = ovOpacity.value / 100; ovOpacityVal.textContent = ovOpacity.value + '%'; });
@@ -3006,6 +6399,9 @@ transType.addEventListener('click', e => { const b = e.target.closest('button');
 transDurRange.addEventListener('input', () => { trans.dur = +transDurRange.value; transDurVal.textContent = (+transDurRange.value).toFixed(2) + 's'; });
 fadeInRange.addEventListener('input', () => { post.fadeIn = +fadeInRange.value; fadeInVal.textContent = (+fadeInRange.value).toFixed(1) + 's'; });
 fadeOutRange.addEventListener('input', () => { post.fadeOut = +fadeOutRange.value; fadeOutVal.textContent = (+fadeOutRange.value).toFixed(1) + 's'; });
+liveFadeRange.addEventListener('input', () => { post.liveFade = +liveFadeRange.value; liveFadeVal.textContent = post.liveFade > 0 ? post.liveFade.toFixed(1) + 's' : 'Off'; });
+maxFpsRange.addEventListener('input', () => { maxFps = +maxFpsRange.value; maxFpsVal.textContent = maxFps > 0 ? maxFps + ' fps' : 'Uncapped'; });
+renderScaleRange.addEventListener('input', () => { renderScale = +renderScaleRange.value / 100; renderScaleVal.textContent = renderScaleRange.value + '%'; resize(); });
 
 // background
 bgType.addEventListener('click', e => { const b = e.target.closest('button'); if (b) { segPick(bgType, b); bg.type = b.dataset.t; } });
@@ -3024,7 +6420,7 @@ sceneSave.addEventListener('click', () => {
   downloadBlob(new Blob([JSON.stringify(collectScene())], { type: 'application/json' }),
     `${(trackName.textContent || 'scene').replace(/[^\w.-]+/g, '_')}.sonarscene.json`);
 });
-sceneLoadBtn.addEventListener('click', () => sceneFile.click());
+sceneLoadBtn.addEventListener('click', () => IN_PLUGIN ? hostLoadPreset() : sceneFile.click());
 sceneFile.addEventListener('change', e => {
   const f = e.target.files[0]; if (!f) return;
   const r = new FileReader();
@@ -3390,19 +6786,32 @@ async function remotePoll() {
   try {
     if (REMOTE.seq < 0) {                                    // first contact → skip the backlog
       const j = await (await fetch('relay.php?channel=cmd&since=2000000000', { cache: 'no-store' })).json();
-      REMOTE.seq = j.seq || 0; return;
+      REMOTE.seq = j.seq || 0; return true;
     }
-    const j = await (await fetch('relay.php?channel=cmd&since=' + REMOTE.seq, { cache: 'no-store' })).json();
+    // wait=20 → the server holds the request until a command lands (long-poll),
+    // so pickup is near-instant instead of on the next polling tick
+    const j = await (await fetch('relay.php?channel=cmd&since=' + REMOTE.seq + '&wait=20', { cache: 'no-store' })).json();
     if (j.items && j.items.length) { for (const c of j.items) { applyRemote(c); REMOTE.seq = c.seq; } remotePublish(); }  // echo fresh state at once
     if (j.seq != null && j.seq > REMOTE.seq) REMOTE.seq = j.seq;
-  } catch (e) {}
+    return true;
+  } catch (e) { return false; }
+}
+
+// re-arm as soon as a held request resolves; if the server can't hold
+// (php -S ignores `wait`) responses come back fast — pace those at 90ms
+async function remoteLoop() {
+  while (true) {
+    const t0 = performance.now();
+    const ok = await remotePoll();
+    const held = performance.now() - t0 > 1000;
+    await new Promise(r => setTimeout(r, ok ? (held ? 0 : 90) : 800));
+  }
 }
 function remotePublish() {
   fetch('relay.php?channel=state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(remoteStateObj()) }).catch(() => {});
 }
 function startRemote() {
-  remotePoll();
-  setInterval(remotePoll, 90);        // low-latency command pickup (Apache handles the rate)
+  remoteLoop();                       // long-polled command pickup (near-instant)
   setInterval(remotePublish, 500);    // state mirror for the panel
   const cu = $('ctrlUrl'), cl = $('ctrlLink');
   if (cu && cl) cu.textContent = cl.href;
@@ -3421,4 +6830,5 @@ initServerClips();      // /vjloops library (streamed)
 loadOverlays();         // user-uploaded clips (IndexedDB)
 resize();
 setMode(0);
-startRemote();          // phone control panel (control.php) over relay.php
+if (!IN_PLUGIN) startRemote();   // phone control panel (control.php) over relay.php — LAN only
+if (IN_PLUGIN) initPlugin();     // FL Studio / VST3 host feeds audio and auto-starts the show
